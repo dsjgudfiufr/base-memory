@@ -65,6 +65,69 @@ bt log add <id> plan "..."                    # 4. 写计划日志（不允许�
 > 子任务**内联在父任务行**（不建独立 Bitable 行），用 `bt subtask done` 完成。
 > 最后一个子任务完成 → 父任务自动标记完成。
 
+### 🧠 Sub-Agent 分层执行（防遗忘机制）
+
+> **核心思想**：参考 Claude Code 架构——主 agent 只负责规划和检查进度，具体执行交给 sub-agent。
+> 这样主 session 的上下文始终保持"规划视角"，进度更新是调度流程的自然环节，不会遗忘。
+
+**判断标准：何时用 sub-agent？**
+
+| 条件 | 执行模式 |
+|---|---|
+| 无子任务，或 ≤2 个简单子任务 | 主 session 直接执行 |
+| ≥3 个子任务，且预估较复杂 | **Sub-Agent 分层模式** |
+| 单个子任务但预估 >15 次工具调用 | **Sub-Agent 分层模式** |
+
+**主 Session（规划者）职责：**
+
+```
+1. 收到任务 → 拆子任务 → bt task add --parent
+2. 逐个派发：
+   a. bt subtask phase <id> "子任务A" "进行中"     ← 更新进度（用户可见）
+   b. sessions_spawn → sub-agent 执行子任务A        ← 具体执行交出去
+   c. 等待 sub-agent 返回结果                        ← 主 session 上下文不被污染
+   d. 确认结果 → 下一个子任务（sub-agent 已自动 bt subtask done）
+   e. bt task next                                    ← 中断检查
+3. 全部完成 → bt task done → 回复用户
+```
+
+**Sub-Agent（执行者）职责：**
+
+- 专注执行单个子任务
+- 在自己的上下文里自由使用工具（不污染主 session）
+- 完成后自己执行 `bt subtask done <父任务ID> "子任务名" -s "摘要"`
+- 完成后返回结果摘要（自动 announce 回主 session）
+- 遇到错误在自己上下文里重试，失败才上报
+
+**spawn 模板：**
+
+```
+sessions_spawn:
+  task: |
+    执行子任务：[子任务名称]
+    
+    背景：[父任务目标]
+    具体要求：[子任务描述]
+    相关文件：[文件路径]
+    约束：[注意事项]
+    
+    完成后必须执行：
+      bt subtask done <父任务ID> "子任务名" -s "你的摘要"
+    
+    返回：
+    1. 做了什么（一句话）
+    2. 产出物路径/结果
+    3. 遇到的问题（如有）
+```
+
+**为什么这样做：**
+
+- ✅ 进度更新是主 session 的"本职工作"（phase），不是额外步骤
+- ✅ 完成更新由 sub-agent 自己执行（done），不依赖主 session 记得做
+- ✅ 主 session 上下文始终干净（只有规划+调度信息）
+- ✅ 每个子任务的执行细节在独立上下文里，不会互相干扰
+- ✅ 用户在多维表格里能实时看到进度变化
+
 ### 阶段转换
 
 ```bash
@@ -202,3 +265,5 @@ bt task done <id> -s "结果摘要（≤200字）"
 | 大内容塞进日志字段 | 超 500 字用 `--file` |
 | 视觉内容留在上下文 | 看完立刻 `bt log add finding` |
 | 每步都通知用户 | 完成才发 `result`，卡住才发 `ask` |
+| 复杂任务（≥3子任务）自己全做 | 用 Sub-Agent 分层：主 session 规划+调度，sub-agent 执行 |
+| 批量 subtask done（一口气完成） | 逐个推进：phase → spawn → 等结果 → done → 下一个 |
