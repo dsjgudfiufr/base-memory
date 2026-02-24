@@ -141,3 +141,15 @@ bt task next    # Interrupt check: higher priority task?
 ```
 
 Credentials: set `FEISHU_APP_ID` + `FEISHU_APP_SECRET` env vars, or pass via config.
+
+## Workflow Rules
+
+For the complete task execution methodology (Manus context engineering adapted for Bitable), see [references/workflow-rules.md](references/workflow-rules.md). Key rules:
+
+- **Task reception**: classify message → task or conversation → only tasks go to Bitable
+- **Plan first**: always `bt log add plan` before executing
+- **Two-action rule**: every 2 search/browse ops → immediately `bt log add finding`
+- **Context offloading**: tool output → log table, not context window
+- **Error protocol**: must change approach before retrying; 5 failures → auto-block
+- **Attention refresh**: `bt task show` every 10 tool calls or before major decisions
+
