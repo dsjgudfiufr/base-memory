@@ -1,0 +1,4 @@
+bitable_config.json
+.bt_state.json
+__pycache__/
+*.pyc
