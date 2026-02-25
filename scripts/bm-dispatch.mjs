@@ -841,8 +841,9 @@ async function planTask(task, cfg) {
 \`\`\`
 
 规则：
-- 如果任务简单（一步能完成），设 needsSubtasks=false，subtasks=[]
-- 如果任务复杂（需要多步），拆成子任务，设 needsSubtasks=true
+- 如果原始指令里提到了多个步骤、多个文件、多个操作，必须拆成子任务
+- 只有真正一步就能完成的（如"查个时间"、"echo一句话"），才设 needsSubtasks=false
+- 倾向于拆分：有疑问就拆
 - plan 字段简洁，不超过 200 字
 - 子任务名称简短明确
 
