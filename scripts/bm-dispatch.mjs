@@ -143,18 +143,44 @@ export function lockStatus() {
 
 // ── Token 计算（代码 diff 方式）──────────────────────────────────
 
-const DISPATCH_SESSION_ID = '34304c8f-cacb-4fac-afcc-b6e2ca6c57c4';
 const SESSION_DIR = resolve(process.env.HOME, '.openclaw/agents/main/sessions');
+const SESSIONS_INDEX = resolve(SESSION_DIR, 'sessions.json');
+
+/**
+ * 动态查找 dispatch session 的 UUID。
+ * 从 OpenClaw 的 sessions.json 索引文件中查找 hook:dispatch 对应的 sessionId。
+ */
+function findDispatchSessionId() {
+  // 优先用环境变量（显式配置）
+  if (process.env.BT_DISPATCH_SESSION_ID) return process.env.BT_DISPATCH_SESSION_ID;
+
+  // 从 sessions.json 动态发现
+  if (!existsSync(SESSIONS_INDEX)) return null;
+  try {
+    const index = JSON.parse(readFileSync(SESSIONS_INDEX, 'utf-8'));
+    // 查找 key 包含 "hook:dispatch" 的条目
+    for (const [key, val] of Object.entries(index)) {
+      if (key.includes('hook:dispatch') && val.sessionId) {
+        return val.sessionId;
+      }
+    }
+  } catch {}
+  return null;
+}
 
 /**
  * 从 session jsonl 文件读取最后一条 assistant 消息的 totalTokens。
  * 这个值是 OpenClaw 维护的累计 token 数，用于 diff 计算。
  */
 function getSessionTotalTokens() {
-  // 动态查找 dispatch session 文件（遍历最近修改的文件）
-  const sessionFile = resolve(SESSION_DIR, `${DISPATCH_SESSION_ID}.jsonl`);
+  const sessionId = findDispatchSessionId();
+  if (!sessionId) {
+    log('⚠️', 'dispatch session 未找到，token 计算跳过');
+    return 0;
+  }
+
+  const sessionFile = resolve(SESSION_DIR, `${sessionId}.jsonl`);
   if (!existsSync(sessionFile)) {
-    // 尝试从配置找 session 文件
     log('⚠️', 'dispatch session 文件不存在，token 计算跳过');
     return 0;
   }
