@@ -217,17 +217,13 @@ def print_task_detail(rec):
 def _trigger_dispatch():
     """后台触发 bm-dispatch.mjs --once，不阻塞当前命令"""
     import subprocess
-    dispatch_script = os.path.join(SCRIPT_DIR, 'bm-dispatch.mjs')
-    if os.path.exists(dispatch_script):
+    trigger_script = os.path.realpath(os.path.join(SCRIPT_DIR, 'bm-dispatch-trigger.sh'))
+    if os.path.exists(trigger_script):
         try:
-            log_file = '/tmp/bm-dispatch-bg.log'
-            with open(log_file, 'a') as f:
-                subprocess.Popen(
-                    ['nohup', 'node', dispatch_script, '--once'],
-                    stdout=f, stderr=f,
-                    start_new_session=True,
-                    cwd=os.path.dirname(os.path.realpath(dispatch_script))
-                )
+            subprocess.Popen(
+                ['bash', trigger_script],
+                start_new_session=True
+            )
         except Exception:
             pass  # 调度失败不影响 bm 命令本身
 
