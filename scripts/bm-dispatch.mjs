@@ -455,7 +455,7 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
         }
       }
     }
-    parts.push(`## 当前子任务\n名称：${subtaskName}${subtaskDesc ? `\n要求：${subtaskDesc}` : ''}`);
+    parts.push(`## 当前子任务\n名称：${subtaskName}${subtaskDesc ? `\n要求：${subtaskDesc}` : ''}\n\n⚠️ 重要：只执行当前子任务「${subtaskName}」，不要做其他子任务。完成后立即写结果文件。`);
   }
 
   if (logLines) {
