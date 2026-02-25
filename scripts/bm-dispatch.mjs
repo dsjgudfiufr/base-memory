@@ -814,7 +814,7 @@ RESULT_EOF
         if (content) {
           const elapsed = Math.round((Date.now() - startTime) / 1000);
           log('📥', `结果文件就绪 (${elapsed}s), ${content.length} 字符`);
-          // DEBUG: keep result file
+          try { unlinkSync(resultFile); } catch {}
           return content;
         }
       }
@@ -824,7 +824,7 @@ RESULT_EOF
     if (elapsed % 30 === 0 && elapsed > 0) log('⏳', `等待 LLM 完成... ${elapsed}s`);
   }
 
-  // DEBUG: keep result file
+  try { unlinkSync(resultFile); } catch {}
   throw new Error(`LLM 超时 (${Math.floor(maxWait / 1000)}s), 结果文件未生成`);
 }
 
