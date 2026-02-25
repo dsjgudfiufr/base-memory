@@ -218,6 +218,8 @@ async function markDone(cfg, recordId, summary) {
   };
   if (summary) fields['结果摘要'] = summary.slice(0, 200);
   await updateRecord(app_token, tableId, recordId, fields);
+  log('✅', `任务完成: ${recordId}`);
+}
 
 /**
  * 更新任务表的单个字段。
@@ -226,8 +228,6 @@ async function updateField(cfg, recordId, fieldName, value) {
   const { app_token } = cfg;
   const tableId = cfg.tables.tasks.id;
   await updateRecord(app_token, tableId, recordId, { [fieldName]: value });
-}
-  log('✅', `任务完成: ${recordId}`);
 }
 
 async function markSubtaskDone(cfg, recordId, subtaskName, summary) {
