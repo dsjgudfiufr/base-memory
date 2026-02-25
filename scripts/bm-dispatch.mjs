@@ -728,7 +728,6 @@ async function callLLM(prompt, opts = {}) {
 
   const dispatchId = Date.now();
   const resultFile = `/tmp/bm-dispatch-result-${dispatchId}.json`;
-  const sessionName = `dispatch-${dispatchId}`;
 
   // prompt 末尾追加结果文件指令（planTask 模式跳过）
   const finalPrompt = opts.rawOutput ? `${prompt}
@@ -771,7 +770,22 @@ RESULT_EOF
 
 ⚠️ 写结果文件是你的最后一步操作。`;
 
-  log('🤖', `触发 hooks/agent, 结果文件: ${resultFile}`);
+  // 构建 hooks/agent 请求体
+  const body = {
+    message: finalPrompt,
+    deliver: true,
+    timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
+  };
+
+  // 支持 session 复用：传入 sessionKey 则复用同一个 session
+  if (opts.sessionKey) {
+    body.sessionKey = opts.sessionKey;
+    body.name = opts.sessionName || 'dispatch';
+    log('🔄', `复用 session: ${opts.sessionKey}, 结果文件: ${resultFile}`);
+  } else {
+    body.name = `dispatch-${dispatchId}`;
+    log('🤖', `新建 session, 结果文件: ${resultFile}`);
+  }
 
   const res = await fetch(`http://localhost:${port}/hooks/agent`, {
     method: 'POST',
@@ -779,12 +793,7 @@ RESULT_EOF
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${hooksToken}`,
     },
-    body: JSON.stringify({
-      message: finalPrompt,
-      name: sessionName,
-      deliver: true,
-      timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -985,12 +994,17 @@ export async function dispatchOnce(opts = {}) {
 }
 
 /**
- * 逐步执行子任务，每步代码自动更新进度。
+ * 逐步执行子任务，所有子任务复用同一个 session（省 token）。
+ * Token 计算：最后一个子任务报告的 tokens 即为整个 session 的累计消耗。
  */
 async function executeWithSubtasks(task, subtasks, planText, cfg) {
   const recordId = task.record_id;
   const allSubtasks = [...subtasks];
   const completedResults = [];
+
+  // 所有子任务复用同一个 session（系统 prompt 只加载一次）
+  const sessionKey = `dispatch:task-${recordId}-${Date.now()}`;
+  log('🔗', `创建共享 session: ${sessionKey}`);
 
   for (let i = 0; i < allSubtasks.length; i++) {
     const subtaskName = allSubtasks[i];
@@ -1005,16 +1019,13 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
     await updateField(cfg, recordId, '任务进展', progressText);
     log('📍', `子任务 ${i + 1}/${allSubtasks.length}: ${subtaskName}`);
 
-    // 构建子任务 prompt（含前序结果）
+    // 构建子任务 prompt（不含前序结果，因为 session 上下文自动保留）
     const prompt = await buildPrompt(task, subtaskName, cfg);
-    const contextPrompt = completedResults.length > 0
-      ? `\n\n## 前序子任务结果\n${completedResults.map(r => `✅ ${r.name}: ${r.summary}`).join('\n')}\n\n${prompt}`
-      : prompt;
 
-    // 执行
+    // 执行（复用 session）
     let rawOutput;
     try {
-      rawOutput = await callLLM(contextPrompt);
+      rawOutput = await callLLM(prompt, { sessionKey, sessionName: `task-${recordId}` });
     } catch (err) {
       const blocked = await incrementErrorCount(cfg, recordId, `子任务 ${subtaskName} 失败: ${err.message}`);
       return { taskId: recordId, status: blocked ? 'blocked' : 'error', summary: err.message };
@@ -1026,7 +1037,6 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
     if (result.status === 'error') {
       const blocked = await incrementErrorCount(cfg, recordId, `子任务 ${subtaskName}: ${result.message || result.summary}`);
       if (blocked) return { taskId: recordId, status: 'blocked', summary: result.message };
-      // 非 block 的错误，跳过这个子任务继续
     }
 
     if (result.status === 'blocked') {
@@ -1048,8 +1058,9 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
   await markDone(cfg, recordId, finalSummary);
   log('🎉', `任务完成: ${allSubtasks.length} 个子任务全部完成`);
 
-  const totalTokens = completedResults.reduce((sum, r) => sum + (r.tokens || 0), 0);
-  return { taskId: recordId, status: 'done', summary: finalSummary, totalTokens };
+  // Token：最后一个子任务的 tokens 是 session 累计值（因为复用同一个 session）
+  const lastTokens = completedResults.length > 0 ? completedResults[completedResults.length - 1].tokens : 0;
+  return { taskId: recordId, status: 'done', summary: finalSummary, totalTokens: lastTokens };
 }
 
 /**
