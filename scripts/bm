@@ -215,9 +215,9 @@ def print_task_detail(rec):
 
 # ── 调度触发 ──────────────────────────────────────────────────────
 def _trigger_dispatch():
-    """后台触发 bm-dispatch.mjs --once，不阻塞当前命令"""
+    """后台触发 bt-dispatch.mjs --once，不阻塞当前命令"""
     import subprocess
-    dispatch_script = os.path.join(SCRIPT_DIR, 'bm-dispatch.mjs')
+    dispatch_script = os.path.join(SCRIPT_DIR, 'bt-dispatch.mjs')
     if os.path.exists(dispatch_script):
         try:
             subprocess.Popen(
@@ -1443,6 +1443,288 @@ def log_search(args):
         print()
 
 
+# ── DISPATCH 子命令 ────────────────────────────────────────────────
+
+def _build_dispatch_prompt(task_rec, subtask_name, c_):
+    """从 Base 任务记录构建 sub-agent prompt"""
+    f = task_rec.get('fields', {})
+    record_id = task_rec.get('record_id', '')
+    name = fv(f, '任务名称')
+    instruction = fv(f, '原始指令')
+    plan = fv(f, '任务规划')
+    phase = fv(f, '当前阶段')
+
+    # 解析子任务进度
+    subtasks = _parse_subtasks(plan) if plan else []
+    progress_lines = ''
+    if subtasks:
+        lines = []
+        for s in subtasks:
+            if plan and f'✅{s}' in plan:
+                lines.append(f'✅ {s}')
+            elif subtask_name and s == subtask_name:
+                lines.append(f'📍 {s} ← 当前')
+            else:
+                lines.append(f'○ {s}')
+        progress_lines = '\n'.join(lines)
+
+    # 读最近日志
+    log_table_id = c_['tables']['logs']['id']
+    log_lines = ''
+    if log_table_id and record_id:
+        try:
+            log_recs = search_records(log_table_id, {
+                'filter': {'conjunction': 'and', 'conditions': [
+                    {'field_name': '关联任务ID', 'operator': 'is', 'value': [record_id]},
+                ]},
+                'field_names': ['类型', '内容', '阶段', '记录时间'],
+                'sort': [{'field_name': '记录时间', 'desc': True}],
+                'page_size': 10,
+            })
+            if log_recs:
+                logs = []
+                for lr in log_recs:
+                    lf = lr.get('fields', {})
+                    t = fv(lf, '类型')
+                    ct = fv(lf, '内容')
+                    if ct:
+                        logs.append(f'- [{t}] {ct}')
+                log_lines = '\n'.join(logs)
+        except:
+            pass
+
+    # 拼装 prompt
+    parts = []
+    parts.append(f'## 任务目标\n{name}')
+    if instruction:
+        parts.append(f'## 原始指令\n{instruction}')
+    if plan:
+        parts.append(f'## 整体规划\n{plan}')
+    if progress_lines:
+        parts.append(f'## 当前进度\n{progress_lines}')
+    elif phase:
+        parts.append(f'## 当前进度\n{phase}')
+    if subtask_name:
+        parts.append(f'## 当前子任务\n名称：{subtask_name}')
+    if log_lines:
+        parts.append(f'## 关键发现和决策（从日志表）\n{log_lines}')
+
+    # 指令：sub-agent 用 bt 命令更新 Base
+    bt_instructions = [
+        '## 执行要求',
+        f'任务ID：{record_id}',
+        '',
+        '你有完整的工具权限（shell、文件读写、网络搜索等）。',
+        '请执行上述任务，并用以下 bt 命令更新进度：',
+        '',
+        f'- 记录发现：`bt log add {record_id} finding "发现内容"`',
+        f'- 记录决策：`bt log add {record_id} decision "决策内容"`',
+        f'- 记录错误：`bt log add {record_id} error "错误内容"`',
+        f'- 更新阶段：`bt task phase {record_id} "阶段N-描述"`',
+    ]
+    if subtask_name:
+        bt_instructions.append(f'- 子任务完成：`bt subtask done {record_id} "{subtask_name}" -s "摘要"`')
+    else:
+        bt_instructions.append(f'- 任务完成：`bt task done {record_id} -s "结果摘要"`')
+    bt_instructions.extend([
+        '',
+        '完成后务必调用上面的 done 命令标记完成。',
+    ])
+    parts.append('\n'.join(bt_instructions))
+
+    return '\n\n'.join(parts)
+
+
+def _find_first_incomplete_subtask(plan_txt):
+    """找到第一个未完成的子任务"""
+    if not plan_txt:
+        return None
+    subtasks = _parse_subtasks(plan_txt)
+    if not subtasks:
+        return None
+    for name in subtasks:
+        if f'✅{name}' not in plan_txt:
+            return name
+    return None  # 全部完成
+
+
+def dispatch_prep(args):
+    """bt dispatch prep — 准备下一个待执行任务的 prompt，输出 JSON"""
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+
+    # 复用 task_next 的排序逻辑
+    candidates = search_records(table_id, {
+        'filter': {'conjunction': 'or', 'conditions': [
+            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
+            {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
+        ]},
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数', '任务规划', '原始指令'],
+        'page_size': 50
+    })
+    if not candidates:
+        print(json.dumps({'status': 'empty', 'message': '没有待处理任务'}, ensure_ascii=False))
+        return
+
+    def sort_key(r):
+        f = r.get('fields', {})
+        pri = fv(f, '优先级')
+        sta = fv(f, '状态')
+        seq = int(fv(f, '执行序号') or 999)
+        return (_priority_rank(pri), _status_rank(sta), seq)
+
+    ranked = sorted(candidates, key=sort_key)
+    task = ranked[0]
+    f = task.get('fields', {})
+    record_id = task.get('record_id', '')
+    name = fv(f, '任务名称')
+    priority = fv(f, '优先级')
+    plan_txt = fv(f, '任务规划')
+    error_count = int(float(fv(f, '错误次数') or '0'))
+
+    # 检查错误次数
+    if error_count >= MAX_ERROR_RETRIES:
+        print(json.dumps({
+            'status': 'blocked',
+            'recordId': record_id,
+            'message': f'错误次数已达上限({error_count}/{MAX_ERROR_RETRIES})'
+        }, ensure_ascii=False))
+        return
+
+    # 找子任务
+    subtask_name = _find_first_incomplete_subtask(plan_txt)
+
+    # 如果是待开始，更新为进行中
+    status = fv(f, '状态')
+    if status == '🕐 待开始':
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+            'fields': {
+                '状态': '🔄 进行中',
+                '开始执行时间': int(time.time() * 1000),
+            }
+        })
+
+    # 构建 prompt
+    prompt = _build_dispatch_prompt(task, subtask_name, c_)
+
+    result = {
+        'status': 'ready',
+        'recordId': record_id,
+        'taskName': name,
+        'priority': priority,
+        'subtask': subtask_name,
+        'errorCount': error_count,
+        'prompt': prompt,
+    }
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def dispatch_status(args):
+    """bt dispatch status — 检查是否有正在运行的 dispatch sub-agent"""
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    recs = search_records(table_id, {
+        'filter': {'conjunction': 'and', 'conditions': [
+            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
+        ]},
+        'field_names': ['任务名称', '优先级', '当前阶段', '错误次数'],
+        'page_size': 10
+    })
+    if not recs:
+        print(c(C.GREEN, '✅ 没有进行中的任务'))
+        return
+    print(f'\n{c(C.BOLD, "📊 进行中任务")}  ({len(recs)} 个)\n')
+    for r in recs:
+        f = r.get('fields', {})
+        rid = r.get('record_id', '')
+        name = fv(f, '任务名称', 30)
+        pri = fv(f, '优先级')
+        phase = fv(f, '当前阶段', 30)
+        print(f'  {fmt_priority(pri)}  {c(C.WHITE, name)}')
+        if phase:
+            print(f'    {c(C.GRAY, f"📍 {phase}")}')
+        print(f'    {c(C.GRAY, rid)}')
+
+
+def dispatch_done(args):
+    """bt dispatch done <id> <result> — 解析 sub-agent 结果并更新 Base
+    result 可以是：
+    - "done" / "error" / "blocked" （简单状态）
+    - JSON 字符串 {"status":"done","summary":"..."}
+    """
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    log_table_id = c_['tables']['logs']['id']
+    record_id = args.id
+    raw_result = args.result
+    summary = args.summary
+    subtask_name = args.subtask
+
+    # 解析结果
+    status = 'done'
+    try:
+        parsed = json.loads(raw_result)
+        status = parsed.get('status', 'done')
+        if not summary:
+            summary = parsed.get('summary', parsed.get('message', parsed.get('reason', '')))
+    except (json.JSONDecodeError, TypeError):
+        # 简单字符串：done / error / blocked
+        status = raw_result.strip().lower()
+        if status not in ('done', 'error', 'blocked'):
+            status = 'done'
+
+    summary = (summary or '')[:200]
+
+    if status == 'done':
+        if subtask_name:
+            # 模拟 subtask done
+            import subprocess
+            cmd = ['bt', 'subtask', 'done', record_id, subtask_name, '-s', summary or f'{subtask_name} 完成']
+            subprocess.run(cmd)
+        else:
+            # 模拟 task done
+            import subprocess
+            cmd = ['bt', 'task', 'done', record_id, '-s', summary, '--force']
+            subprocess.run(cmd)
+    elif status == 'error':
+        # 记录错误
+        r = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}')
+        rec = r.get('data', {}).get('record', {})
+        cur_count = int(float(fv(rec.get('fields', {}), '错误次数') or '0'))
+        new_count = cur_count + 1
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+            'fields': {'错误次数': new_count}
+        })
+        # 写 error 日志
+        api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records', {
+            'fields': {
+                '关联任务ID': record_id,
+                '类型': '❌ 错误',
+                '内容': f'dispatch错误(#{new_count})：{summary}'[:500],
+            }
+        })
+        if new_count >= MAX_ERROR_RETRIES:
+            api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+                'fields': {'状态': '🚧 阻塞中'}
+            })
+            warn(f'错误达上限({new_count}/{MAX_ERROR_RETRIES})，任务已阻塞')
+        else:
+            warn(f'错误 #{new_count}/{MAX_ERROR_RETRIES}：{summary}')
+    elif status == 'blocked':
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+            'fields': {'状态': '🚧 阻塞中'}
+        })
+        # 写阻塞日志
+        api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records', {
+            'fields': {
+                '关联任务ID': record_id,
+                '类型': '🚧 阻塞',
+                '内容': f'阻塞原因：{summary}'[:500],
+            }
+        })
+        warn(f'任务已标记阻塞：{summary}')
+
+
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -1589,6 +1871,24 @@ def main():
     p = mem_sub.add_parser('search', help='搜索记忆')
     p.add_argument('keyword', help='搜索词')
 
+    # ── dispatch ──
+    dispatch_p = sub.add_parser('dispatch', help='调度器：准备任务 prompt 供 sessions_spawn 使用')
+    dispatch_sub = dispatch_p.add_subparsers(dest='action', metavar='<操作>')
+
+    # dispatch prep — 获取下一个任务并构建 prompt
+    p = dispatch_sub.add_parser('prep', help='准备下一个任务的 prompt（JSON 输出）')
+    p.add_argument('--json', action='store_true', dest='json_output', help='纯 JSON 输出（供程序调用）')
+
+    # dispatch done — 解析 sub-agent 结果并更新 Base
+    p = dispatch_sub.add_parser('done', help='解析执行结果并更新 Base')
+    p.add_argument('id', help='record_id')
+    p.add_argument('result', help='结果 JSON 字符串 或 "done"/"error"/"blocked"')
+    p.add_argument('-s', '--summary', default='', metavar='摘要', help='结果摘要')
+    p.add_argument('--subtask', default='', metavar='子任务名', help='子任务名称（有子任务时）')
+
+    # dispatch status — 查看进行中任务
+    dispatch_sub.add_parser('status', help='查看进行中任务状态')
+
     # ── 路由 ──
     args = parser.parse_args()
 
@@ -1625,6 +1925,11 @@ def main():
         if not args.action:   mem_p.print_help(); return
         dispatch = {'add': mem_add, 'ls': mem_ls, 'search': mem_search}
         dispatch.get(args.action, lambda a: mem_p.print_help())(args)
+
+    elif args.cmd == 'dispatch':
+        if not args.action:   dispatch_p.print_help(); return
+        dispatch = {'prep': dispatch_prep, 'done': dispatch_done, 'status': dispatch_status}
+        dispatch.get(args.action, lambda a: dispatch_p.print_help())(args)
 
     else:
         # 无参数时显示帮助 + 当前状态

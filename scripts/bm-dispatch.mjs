@@ -756,7 +756,7 @@ echo '{"status":"blocked","reason":"阻塞原因"}' > ${resultFile}
     body: JSON.stringify({
       message: augmentedPrompt,
       name: sessionName,
-      deliver: false,
+      deliver: true,
       timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
     }),
   });
