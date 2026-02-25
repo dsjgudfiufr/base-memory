@@ -28,6 +28,8 @@ const CONFIG_PATH = existsSync(CONFIG_FILE)
   : resolve(__dirname, '../../scripts/base_config.json');
 
 const MAX_ERROR_RETRIES = parseInt(process.env.BT_MAX_ERROR_RETRIES || '5', 10);
+const REPLAN_CONSECUTIVE_ERRORS = 3; // 同一子任务连续失败 N 次触发 replan
+const MAX_REPLAN_ATTEMPTS = 1; // 每个任务最多 replan 次数（避免无限循环）
 const POLL_INTERVAL_MS = parseInt(process.env.BT_POLL_INTERVAL_MS || '30000', 10); // 主循环间隔
 const LLM_POLL_INTERVAL_MS = parseInt(process.env.BT_LLM_POLL_MS || '10000', 10);
 const LLM_TIMEOUT_MS = parseInt(process.env.BT_LLM_TIMEOUT_MS || '600000', 10); // 10 min
@@ -132,10 +134,33 @@ function parseSubtasks(planText) {
     const trimmed = line.trim();
     if (trimmed.startsWith('子任务') && (trimmed.includes('：') || trimmed.includes(':'))) {
       const parts = trimmed.includes('：') ? trimmed.split('：', 2)[1] : trimmed.split(':', 2)[1];
-      return (parts || '').split('→').map(n => n.trim().replace(/^✅/, '').trim()).filter(Boolean);
+      return (parts || '').split('→').map(n => n.trim().replace(/^(✅|📍|○)/, '').trim()).filter(Boolean);
     }
   }
   return [];
+}
+
+/**
+ * 从 planText 中解析已完成的子任务列表。
+ */
+function parseCompletedSubtasks(planText) {
+  if (!planText) return [];
+  const completed = [];
+  const lines = planText.replace(/\\n/g, '\n').split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // 匹配进度行中的 ✅ 标记
+    if (trimmed.includes('✅')) {
+      const matches = trimmed.match(/✅([^→✅○📍]+)/g);
+      if (matches) {
+        matches.forEach(m => {
+          const name = m.replace('✅', '').trim();
+          if (name) completed.push(name);
+        });
+      }
+    }
+  }
+  return completed;
 }
 
 function findFirstIncompleteSubtask(planText) {
@@ -499,16 +524,23 @@ function extractResultJSON(raw) {
     return null;
   };
 
+  // 标准化结果：保留 needReplan 字段
+  const normalize = (obj) => {
+    const result = { files: [], ...obj };
+    if (obj.needReplan !== undefined) result.needReplan = !!obj.needReplan;
+    return result;
+  };
+
   // 1. 直接解析整个输出
   const direct = tryParse(raw.trim());
-  if (direct) return { files: [], ...direct };
+  if (direct) return normalize(direct);
 
   // 2. 从 markdown code block 中提取
   const codeBlockRe = /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/g;
   let cbMatch;
   while ((cbMatch = codeBlockRe.exec(raw)) !== null) {
     const parsed = tryParse(cbMatch[1].trim());
-    if (parsed) return { files: [], ...parsed };
+    if (parsed) return normalize(parsed);
   }
 
   // 3. 贪心匹配：找包含 "status" 的 JSON 对象（支持嵌套大括号）
@@ -529,7 +561,7 @@ function extractResultJSON(raw) {
   // 从后往前尝试（最后一个 JSON 块通常是最终结果）
   for (let i = jsonCandidates.length - 1; i >= 0; i--) {
     const parsed = tryParse(jsonCandidates[i]);
-    if (parsed) return { files: [], ...parsed };
+    if (parsed) return normalize(parsed);
   }
 
   // 4. 关键词兜底
@@ -908,6 +940,80 @@ function extractPlanJSON(raw) {
   return fallback;
 }
 
+// ── Replan ────────────────────────────────────────────────────────
+
+/**
+ * 基于已完成子任务和失败原因，让 LLM 重新规划未完成部分。
+ * 保留已完成的成果，只重新规划失败及后续的子任务。
+ *
+ * @param {object} task - Base 任务记录
+ * @param {Array} completedResults - 已完成子任务 [{name, summary}]
+ * @param {string} failedAt - 失败的子任务名
+ * @param {string} reason - 失败/replan 原因
+ * @param {object} cfg - base_config
+ * @returns {{ plan: string, subtasks: string[] }}
+ */
+async function replanTask(task, completedResults, failedAt, reason, cfg) {
+  const fields = task.fields || {};
+  const taskName = fv(fields, '任务名称');
+  const rawInstruction = fv(fields, '原始指令');
+  const currentPlan = fv(fields, '任务进展');
+
+  const completedSummary = completedResults
+    .filter(r => !r.summary.includes('恢复跳过'))
+    .map(r => `✅ ${r.name}：${r.summary}`)
+    .join('\n') || '(无已完成子任务)';
+
+  const replanPrompt = `你是一个任务重新规划器。之前的计划在执行过程中遇到了问题，需要你重新规划未完成的部分。
+
+## 原始任务
+名称：${taskName}
+原始指令：${rawInstruction}
+
+## 之前的计划
+${currentPlan || '(无)'}
+
+## 已完成的子任务（保留，不要重新规划）
+${completedSummary}
+
+## 失败点
+子任务「${failedAt}」失败。
+原因：${reason}
+
+## 输出格式
+只输出 JSON，不要其他文字：
+\`\`\`json
+{
+  "plan": "基于已完成部分的新规划（一句话目标 + 新的子任务阶段）",
+  "subtasks": ["新子任务X", "新子任务Y"],
+  "reasoning": "为什么要这样重新规划"
+}
+\`\`\`
+
+规则：
+- 已完成的子任务不要包含在 subtasks 里
+- 失败的子任务可以用不同方式重新表述
+- 考虑失败原因，调整方法或拆分粒度
+- 子任务名称简短明确
+- plan 字段不超过 200 字
+
+只输出 JSON。`;
+
+  const raw = await callLLM(replanPrompt, { rawOutput: true });
+  const parsed = extractPlanJSON(raw);
+
+  // 如果 replan 没产出有效子任务，回退到单任务模式
+  if (!parsed.subtasks || parsed.subtasks.length === 0) {
+    log('⚠️', 'replan 未产出新子任务，回退到单任务模式');
+    return { plan: parsed.plan || `重新执行：${taskName}`, subtasks: [] };
+  }
+
+  log('🔄', `Replan 完成: ${parsed.subtasks.length} 个新子任务 [${parsed.subtasks.join(', ')}]`);
+  if (parsed.reasoning) log('💡', `Replan 理由: ${parsed.reasoning}`);
+
+  return parsed;
+}
+
 // ── 单轮调度 ─────────────────────────────────────────────────────
 
 /**
@@ -963,19 +1069,75 @@ export async function dispatchOnce(opts = {}) {
       log('⚠️', `规划失败: ${err.message}，直接执行`);
     }
   } else {
-    // 从已有规划中解析子任务
-    subtasks = parseSubtasks(planText).filter(s => !s.startsWith('✅'));
+    // 从已有规划中解析全部子任务（包括已完成的，断点恢复在 executeWithSubtasks 内处理）
+    subtasks = parseSubtasks(planText);
   }
 
   // ── 第二步：执行 ───────────────────────────────────────────────
   let result;
+  let replanAttempt = 0;
+
   if (subtasks.length > 0) {
     result = await executeWithSubtasks(task, subtasks, planText, cfg);
+
+    // ── Replan 处理 ──────────────────────────────────────────────
+    while (result.status === 'replan' && replanAttempt < MAX_REPLAN_ATTEMPTS) {
+      replanAttempt++;
+      log('🔄', `触发 Replan (#${replanAttempt}): ${result.reason}`);
+
+      // 写日志记录 replan 事件
+      await writeLog(cfg, recordId, '🔄 重规划',
+        `Replan #${replanAttempt}: ${result.reason}\n已完成: [${(result.completed || []).map(c => c.name).join(', ')}]\n失败于: ${result.failedAt}`);
+
+      try {
+        const newPlan = await replanTask(task, result.completed || [], result.failedAt, result.reason, cfg);
+
+        if (newPlan.subtasks.length === 0) {
+          // Replan 回退到单任务模式
+          log('⚠️', 'Replan 回退到单任务模式');
+          planText = newPlan.plan;
+          await updateField(cfg, recordId, '任务进展', planText);
+          result = await executeSingle(task, cfg);
+          break;
+        }
+
+        // 构建新的 planText（保留已完成 + 新子任务）
+        const completedLine = (result.completed || [])
+          .filter(c => !c.summary.includes('恢复跳过'))
+          .map(c => `✅${c.name}`).join(' → ');
+        const newLine = newPlan.subtasks.map(s => `○${s}`).join(' → ');
+        planText = `${newPlan.plan}\n子任务：${completedLine ? completedLine + ' → ' : ''}${newPlan.subtasks.join(' → ')}`;
+
+        await updateField(cfg, recordId, '任务进展', planText);
+        await updateField(cfg, recordId, '错误次数', 0); // 重置错误计数
+
+        // 重新解析子任务列表（包含已完成的，executeWithSubtasks 会跳过）
+        subtasks = parseSubtasks(planText);
+
+        // 刷新 task fields 缓存
+        const freshTask = await getRecord(cfg.app_token, cfg.tables.tasks.id, recordId);
+        if (freshTask) task = freshTask;
+
+        result = await executeWithSubtasks(task, subtasks, planText, cfg);
+      } catch (err) {
+        log('⚠️', `Replan 执行失败: ${err.message}`);
+        result = { taskId: recordId, status: 'error', summary: `Replan 失败: ${err.message}` };
+        break;
+      }
+    }
+
+    // Replan 达上限仍失败
+    if (result.status === 'replan') {
+      log('🚧', `Replan 达上限 (${MAX_REPLAN_ATTEMPTS})，标记阻塞`);
+      await updateField(cfg, recordId, '状态', '🚧 阻塞中');
+      await notifyOwner(cfg, recordId, taskName, -1, `Replan ${MAX_REPLAN_ATTEMPTS} 次仍失败: ${result.reason}`);
+      result = { taskId: recordId, status: 'blocked', summary: `Replan 失败: ${result.reason}` };
+    }
   } else {
     result = await executeSingle(task, cfg);
   }
 
-  // 写入 Token 开销（从结果 JSON 的 tokens 字段累加）
+  // 写入 Token 开销
   try {
     const totalTokens = result.totalTokens || result.tokens || 0;
     if (totalTokens > 0) {
@@ -995,22 +1157,39 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
   const allSubtasks = [...subtasks];
   const completedResults = [];
 
-  // 每个子任务独立 session（通过 hooks.defaultSessionKey=hook:dispatch 隔离）
+  // 断点恢复：从 planText 解析已完成子任务，跳过它们
+  const alreadyCompleted = parseCompletedSubtasks(planText);
+  if (alreadyCompleted.length > 0) {
+    log('⏭️', `断点恢复：跳过已完成子任务 [${alreadyCompleted.join(', ')}]`);
+  }
+
+  // 连续失败计数器（用于 replan 判断）
+  let consecutiveErrorCount = 0;
+  let lastFailedSubtask = '';
+
+  // Session 复用：所有子任务共享 hook:dispatch session（上下文自动保留）
 
   for (let i = 0; i < allSubtasks.length; i++) {
     const subtaskName = allSubtasks[i];
+
+    // 跳过已完成的子任务（断点恢复）
+    if (alreadyCompleted.includes(subtaskName)) {
+      completedResults.push({ name: subtaskName, summary: '(已完成，恢复跳过)', files: [], tokens: 0 });
+      continue;
+    }
+
     const progressLine = allSubtasks.map((s, j) => {
-      if (j < i) return `✅${s}`;
-      if (j === i) return `📍${s}`;
+      if (completedResults.some(r => r.name === s)) return `✅${s}`;
+      if (s === subtaskName) return `📍${s}`;
       return `○${s}`;
     }).join(' → ');
 
-    // 代码写表：任务进展（合并进度信息）
+    // 代码写表：任务进展
     const progressText = `${planText.split('\n')[0]}\n📍 ${subtaskName} (${i + 1}/${allSubtasks.length})\n${progressLine}`;
     await updateField(cfg, recordId, '任务进展', progressText);
     log('📍', `子任务 ${i + 1}/${allSubtasks.length}: ${subtaskName}`);
 
-    // 构建子任务 prompt（不含前序结果，因为 session 上下文自动保留）
+    // 构建子任务 prompt（不含前序结果，session 上下文自动保留）
     const prompt = await buildPrompt(task, subtaskName, cfg);
 
     // 执行（复用 session）
@@ -1018,38 +1197,85 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
     try {
       rawOutput = await callLLM(prompt);
     } catch (err) {
+      consecutiveErrorCount = (lastFailedSubtask === subtaskName) ? consecutiveErrorCount + 1 : 1;
+      lastFailedSubtask = subtaskName;
+
       const blocked = await incrementErrorCount(cfg, recordId, `子任务 ${subtaskName} 失败: ${err.message}`);
-      return { taskId: recordId, status: blocked ? 'blocked' : 'error', summary: err.message };
+      if (blocked) return { taskId: recordId, status: 'blocked', summary: err.message };
+
+      // Replan 判断
+      if (consecutiveErrorCount >= REPLAN_CONSECUTIVE_ERRORS) {
+        return {
+          taskId: recordId, status: 'replan',
+          completed: completedResults, failedAt: subtaskName,
+          reason: `子任务「${subtaskName}」连续失败 ${consecutiveErrorCount} 次`,
+        };
+      }
+      return { taskId: recordId, status: 'error', summary: err.message };
     }
 
     // 解析结果
     const result = extractResultJSON(rawOutput);
 
     if (result.status === 'error') {
+      consecutiveErrorCount = (lastFailedSubtask === subtaskName) ? consecutiveErrorCount + 1 : 1;
+      lastFailedSubtask = subtaskName;
+
       const blocked = await incrementErrorCount(cfg, recordId, `子任务 ${subtaskName}: ${result.message || result.summary}`);
       if (blocked) return { taskId: recordId, status: 'blocked', summary: result.message };
+
+      // LLM 显式请求 replan
+      if (result.needReplan) {
+        return {
+          taskId: recordId, status: 'replan',
+          completed: completedResults, failedAt: subtaskName,
+          reason: result.reason || result.message || 'LLM 请求 replan',
+        };
+      }
+
+      // 连续失败达阈值 → replan
+      if (consecutiveErrorCount >= REPLAN_CONSECUTIVE_ERRORS) {
+        return {
+          taskId: recordId, status: 'replan',
+          completed: completedResults, failedAt: subtaskName,
+          reason: `子任务「${subtaskName}」连续失败 ${consecutiveErrorCount} 次`,
+        };
+      }
+
+      return { taskId: recordId, status: 'error', summary: result.message || result.summary };
     }
 
     if (result.status === 'blocked') {
+      // LLM 请求 replan 的 blocked 也触发 replan
+      if (result.needReplan) {
+        return {
+          taskId: recordId, status: 'replan',
+          completed: completedResults, failedAt: subtaskName,
+          reason: result.reason || '子任务阻塞，需要重新规划',
+        };
+      }
       await updateField(cfg, recordId, '状态', '🔒阻塞');
       await updateField(cfg, recordId, '任务进展', `🔒 ${subtaskName} 阻塞: ${result.reason || ''}`);
       return { taskId: recordId, status: 'blocked', summary: result.reason };
     }
 
-    // 子任务完成
+    // 子任务完成 → 重置连续失败计数
+    consecutiveErrorCount = 0;
+    lastFailedSubtask = '';
     completedResults.push({ name: subtaskName, summary: result.summary || 'done', files: result.files || [], tokens: result.tokens || 0 });
     log('✅', `子任务完成: ${subtaskName} — ${(result.summary || '').slice(0, 60)}`);
   }
 
   // 全部子任务完成
   const finalProgress = allSubtasks.map(s => `✅${s}`).join(' → ');
-  const finalSummary = completedResults.map(r => r.summary).join('; ').slice(0, 200);
+  const finalSummary = completedResults
+    .filter(r => !r.summary.includes('恢复跳过'))
+    .map(r => r.summary).join('; ').slice(0, 200);
 
   await updateField(cfg, recordId, '任务进展', `✅ 全部完成\n${finalProgress}`);
   await markDone(cfg, recordId, finalSummary);
   log('🎉', `任务完成: ${allSubtasks.length} 个子任务全部完成`);
 
-  // Token：最后一个子任务的 tokens 是 session 累计值（因为复用同一个 session）
   const lastTokens = completedResults.length > 0 ? completedResults[completedResults.length - 1].tokens : 0;
   return { taskId: recordId, status: 'done', summary: finalSummary, totalTokens: lastTokens };
 }
