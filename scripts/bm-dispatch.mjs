@@ -746,24 +746,26 @@ RESULT_EOF
 完成任务后，把结果 JSON 写入指定文件。这是调度器获取结果的唯一方式。
 不要调用 bm 命令更新多维表格，调度器会自动处理。
 
+**写结果文件前，先用 session_status 工具查看当前 token 用量，把 tokens_in 填入结果 JSON 的 tokens 字段。**
+
 成功：
 \`\`\`bash
 cat > ${resultFile} << 'RESULT_EOF'
-{"status":"done","summary":"一句话描述你做了什么","files":["产出文件路径"]}
+{"status":"done","summary":"一句话描述你做了什么","files":["产出文件路径"],"tokens":12345}
 RESULT_EOF
 \`\`\`
 
 失败：
 \`\`\`bash
 cat > ${resultFile} << 'RESULT_EOF'
-{"status":"error","message":"错误描述"}
+{"status":"error","message":"错误描述","tokens":12345}
 RESULT_EOF
 \`\`\`
 
 阻塞（需要人工介入）：
 \`\`\`bash
 cat > ${resultFile} << 'RESULT_EOF'
-{"status":"blocked","reason":"阻塞原因"}
+{"status":"blocked","reason":"阻塞原因","tokens":12345}
 RESULT_EOF
 \`\`\`
 
@@ -965,18 +967,18 @@ export async function dispatchOnce(opts = {}) {
 
   // ── 第二步：执行 ───────────────────────────────────────────────
   let result;
-  let llmCalls = planText ? 0 : 1; // 规划用了 1 次
   if (subtasks.length > 0) {
     result = await executeWithSubtasks(task, subtasks, planText, cfg);
-    llmCalls += subtasks.length; // 每个子任务 1 次
   } else {
     result = await executeSingle(task, cfg);
-    llmCalls += 1;
   }
 
-  // 写入 LLM 调用次数到 Token 开销字段
+  // 写入 Token 开销（从结果 JSON 的 tokens 字段累加）
   try {
-    await updateField(cfg, recordId, 'Token 开销', llmCalls);
+    const totalTokens = result.totalTokens || result.tokens || 0;
+    if (totalTokens > 0) {
+      await updateField(cfg, recordId, 'Token 开销', totalTokens);
+    }
   } catch {}
 
   return result;
@@ -1034,7 +1036,7 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
     }
 
     // 子任务完成
-    completedResults.push({ name: subtaskName, summary: result.summary || 'done', files: result.files || [] });
+    completedResults.push({ name: subtaskName, summary: result.summary || 'done', files: result.files || [], tokens: result.tokens || 0 });
     log('✅', `子任务完成: ${subtaskName} — ${(result.summary || '').slice(0, 60)}`);
   }
 
@@ -1046,7 +1048,8 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
   await markDone(cfg, recordId, finalSummary);
   log('🎉', `任务完成: ${allSubtasks.length} 个子任务全部完成`);
 
-  return { taskId: recordId, status: 'done', summary: finalSummary };
+  const totalTokens = completedResults.reduce((sum, r) => sum + (r.tokens || 0), 0);
+  return { taskId: recordId, status: 'done', summary: finalSummary, totalTokens };
 }
 
 /**
@@ -1070,7 +1073,7 @@ async function executeSingle(task, cfg) {
   const result = await parseResult(rawOutput, task, null, cfg);
   log('📊', `结果: status=${result.status}, summary=${(result.summary || result.message || '').slice(0, 80)}`);
 
-  return { taskId: recordId, status: result.status, summary: result.summary || result.message || '' };
+  return { taskId: recordId, status: result.status, summary: result.summary || result.message || '', tokens: result.tokens || 0 };
 }
 
 // ── 主循环 ───────────────────────────────────────────────────────
