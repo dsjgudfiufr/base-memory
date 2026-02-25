@@ -926,7 +926,7 @@ export async function dispatchOnce(opts = {}) {
   const errorCount = parseInt(fv(fields, '错误次数') || '0', 10);
 
   log('🎯', `调度任务: ${priority} ${taskName}`);
-  log('📋', `record_id: ${recordId}, 错误次数: ${errorCount}`);
+  log('📋', `record_id: ${recordId}, 错误次数: ${errorCount}, 任务进展: "${planText ? planText.slice(0, 50) : '(空)'}"`);
 
   // 更新状态为进行中
   await markInProgress(cfg, recordId);

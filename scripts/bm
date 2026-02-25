@@ -316,7 +316,7 @@ def task_add(args):
         '状态':        '🔄 进行中',
         '优先级':      priority,
         '开始执行时间': now_ms,   # 任务启动时刻（不同于创建时间）
-        '任务进展':    '阶段1-需求探索',  # 建立时自动设初始阶段，Base立即可见
+        # 任务进展由 dispatch 自动规划填写，建任务时留空
     }
     if args.instruction: fields['原始指令'] = args.instruction
     # ── 父任务：子任务内联模式（方案A：不建独立行）────────────────
