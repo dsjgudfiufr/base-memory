@@ -610,6 +610,81 @@ test('lockStatus 过期锁返回 locked:false', () => {
   cleanLock();
 });
 
+// ══ 11. 抢占恢复（Preemption Resume）══════════════════════════
+
+console.log('\n📋 11. 抢占恢复');
+
+test('断点文本保留子任务前缀，恢复时能解析', () => {
+  // 模拟 checkPreemption 写的断点文本（修复后包含 子任务：前缀）
+  const allSubtasks = ['调研API', '写代码', '测试'];
+  const completedResults = [{ name: '调研API', summary: '完成' }];
+  const planFirstLine = '目标：实现新功能';
+  const nextName = '紧急修复Bug';
+  const doneCount = 1;
+
+  const breakpointLine = allSubtasks.map(s => {
+    if (completedResults.some(r => r.name === s)) return `✅${s}`;
+    return `○${s}`;
+  }).join(' → ');
+  const breakpointText = `${planFirstLine}\n⏸️ 已暂停 (${doneCount}/${allSubtasks.length}) — 被 ${nextName} 抢占\n子任务：${breakpointLine}`;
+
+  // 验证 parseSubtasks 能解析出所有子任务
+  const parsed = parseSubtasks(breakpointText);
+  assertEqual(parsed.length, 3);
+  assertEqual(parsed[0], '调研API');
+  assertEqual(parsed[1], '写代码');
+  assertEqual(parsed[2], '测试');
+
+  // 验证 parseCompletedSubtasks 能识别已完成的
+  const completed = parseCompletedSubtasks(breakpointText);
+  assertEqual(completed.length, 1);
+  assertEqual(completed[0], '调研API');
+});
+
+test('断点文本无子任务前缀时解析失败（旧格式）', () => {
+  // 旧版 bug：断点文本没有 子任务：前缀
+  const oldBreakpoint = '目标：实现新功能\n⏸️ 已暂停 (1/3) — 被 紧急修复Bug 抢占\n✅调研API → ○写代码 → ○测试';
+  const parsed = parseSubtasks(oldBreakpoint);
+  assertEqual(parsed.length, 0); // 旧格式解析不出来
+});
+
+test('恢复时跳过已完成子任务，从断点继续', () => {
+  const breakpointText = '目标：实现新功能\n⏸️ 已暂停 (2/3)\n子任务：✅调研API → ✅写代码 → ○测试';
+
+  const allSubtasks = parseSubtasks(breakpointText);
+  assertEqual(allSubtasks.length, 3);
+
+  const completed = parseCompletedSubtasks(breakpointText);
+  assertEqual(completed.length, 2);
+  assert(completed.includes('调研API'), 'should include 调研API');
+  assert(completed.includes('写代码'), 'should include 写代码');
+
+  // 模拟 executeWithSubtasks 的跳过逻辑
+  const toExecute = allSubtasks.filter(s => !completed.includes(s));
+  assertEqual(toExecute.length, 1);
+  assertEqual(toExecute[0], '测试');
+});
+
+test('全部完成的断点文本（不应出现，但要能处理）', () => {
+  const breakpointText = '目标：xxx\n子任务：✅A → ✅B → ✅C';
+  const allSubtasks = parseSubtasks(breakpointText);
+  assertEqual(allSubtasks.length, 3);
+  const completed = parseCompletedSubtasks(breakpointText);
+  assertEqual(completed.length, 3);
+  const toExecute = allSubtasks.filter(s => !completed.includes(s));
+  assertEqual(toExecute.length, 0);
+});
+
+test('零完成的断点文本（刚开始就被抢占）', () => {
+  const breakpointText = '目标：xxx\n⏸️ 已暂停 (0/3)\n子任务：○A → ○B → ○C';
+  const allSubtasks = parseSubtasks(breakpointText);
+  assertEqual(allSubtasks.length, 3);
+  const completed = parseCompletedSubtasks(breakpointText);
+  assertEqual(completed.length, 0);
+  const toExecute = allSubtasks.filter(s => !completed.includes(s));
+  assertEqual(toExecute.length, 3);
+});
+
 // ══ 结果 ════════════════════════════════════════════════════════
 
 console.log(`\n${'═'.repeat(50)}`);
