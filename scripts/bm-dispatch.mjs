@@ -1477,16 +1477,17 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
       continue;
     }
 
+    const doneCount = completedResults.filter(r => !r.summary.includes('恢复跳过')).length;
     const progressLine = allSubtasks.map((s, j) => {
       if (completedResults.some(r => r.name === s)) return `✅${s}`;
       if (s === subtaskName) return `📍${s}`;
       return `○${s}`;
     }).join(' → ');
 
-    // 代码写表：任务进展
-    const progressText = `${planText.split('\n')[0]}\n📍 ${subtaskName} (${i + 1}/${allSubtasks.length})\n${progressLine}`;
+    // 代码写表：任务进展（N/M = 已完成N个/共M个）
+    const progressText = `${planText.split('\n')[0]}\n📍 ${subtaskName} (${doneCount}/${allSubtasks.length})\n${progressLine}`;
     await updateField(cfg, recordId, '任务进展', progressText);
-    log('📍', `子任务 ${i + 1}/${allSubtasks.length}: ${subtaskName}`);
+    log('📍', `子任务 (${doneCount}/${allSubtasks.length}): ${subtaskName}`);
 
     // 构建子任务 prompt（不含前序结果，session 上下文自动保留）
     const prompt = await buildPrompt(task, subtaskName, cfg);
