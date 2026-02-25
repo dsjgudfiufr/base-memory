@@ -356,6 +356,7 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
   
 
   // ── 解析子任务进度 ──────────────────────────────────────────────
+  const progress = fv(fields, '任务进展');
   const subtasks = parseSubtasks(plan);
   let progressLines = '';
   if (subtasks.length > 0) {
@@ -453,8 +454,8 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
 
     if (progressLines) {
       parts.push(`## 当前进度\n${progressLines}`);
-    } else if (phase) {
-      parts.push(`## 当前进度\n${phase}`);
+    } else if (progress) {
+      parts.push(`## 当前进度\n${progress}`);
     }
   }
 
