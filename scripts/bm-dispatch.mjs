@@ -163,7 +163,7 @@ async function fetchNextTask(cfg) {
         { field_name: '状态', operator: 'is', value: ['🕐 待开始'] },
       ],
     },
-    field_names: ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数', '任务进展', '原始指令'],
+    field_names: ['任务名称', '状态', '优先级', '执行序号', '错误次数', '任务进展', '原始指令'],
     page_size: 50,
   });
 
@@ -193,9 +193,7 @@ async function markInProgress(cfg, recordId, subtaskName) {
   const tableId = cfg.tables.tasks.id;
   const fields = { '状态': '🔄 进行中' };
 
-  // 如果有子任务，更新当前阶段
   if (subtaskName) {
-    fields['当前阶段'] = `📍${subtaskName}：进行中（dispatch）`;
   }
 
   // 如果是待开始，补开始时间
@@ -214,7 +212,6 @@ async function markDone(cfg, recordId, summary) {
   const fields = {
     '状态': '✅ 已完成',
     '完成时间': Date.now(),
-    '当前阶段': '✅ 交付完成',
   };
   if (summary) fields['结果摘要'] = summary.slice(0, 200);
   await updateRecord(app_token, tableId, recordId, fields);
@@ -251,11 +248,9 @@ async function markSubtaskDone(cfg, recordId, subtaskName, summary) {
   if (allDone) {
     fields['状态'] = '✅ 已完成';
     fields['完成时间'] = Date.now();
-    fields['当前阶段'] = '✅ 全部完成';
     fields['结果摘要'] = `全部 ${subtasks.length} 个子任务已完成`;
   } else {
     const next = subtasks.find(s => !planText.includes(`✅${s}`));
-    fields['当前阶段'] = next ? `📍${next}` : '✅ 全部完成';
   }
 
   await updateRecord(app_token, tableId, recordId, fields);
@@ -302,10 +297,9 @@ async function incrementErrorCount(cfg, recordId, errorMsg) {
   }
 
   // 更新阶段显示 ⚠️
-  const phase = fv(rec?.fields, '当前阶段') || '';
+  const phase = fv(rec?.fields, '任务进展') || '';
   if (!phase.startsWith('⚠️')) {
     await updateRecord(app_token, tableId, recordId, {
-      '当前阶段': `⚠️ ${phase}（第${newCount}次失败，需换方法）`,
     });
   }
 
@@ -359,7 +353,7 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
   const name = fv(fields, '任务名称');
   const instruction = fv(fields, '原始指令');
   const plan = fv(fields, '任务进展');
-  const phase = fv(fields, '当前阶段');
+  
 
   // ── 解析子任务进度 ──────────────────────────────────────────────
   const subtasks = parseSubtasks(plan);
@@ -629,7 +623,7 @@ export async function parseResult(raw, task, subtask, cfg) {
           await markDone(cfg, recordId, normalized.summary);
           // 写 milestone 日志（markDone 不写日志，这里补）
           await writeLog(cfg, recordId, '🏁 里程碑',
-            `完成：${normalized.summary}`, fv(fields, '当前阶段'));
+            `完成：${normalized.summary}`, fv(fields, '任务进展'));
         }
         break;
       }
@@ -644,10 +638,8 @@ export async function parseResult(raw, task, subtask, cfg) {
         // 更新错误次数
         await updateRecord(app_token, tableId, recordId, { '错误次数': newCount });
 
-        // 当前阶段追加失败标记
-        const phase = fv(rec?.fields, '当前阶段') || '';
+        const phase = fv(rec?.fields, '任务进展') || '';
         await updateRecord(app_token, tableId, recordId, {
-          '当前阶段': `${phase} ⚠️ 第${newCount}次失败`,
         });
 
         // 写 error 日志
@@ -681,7 +673,7 @@ export async function parseResult(raw, task, subtask, cfg) {
         // 写 blocked 日志
         await writeLog(cfg, recordId, '🔒 阻塞',
           `阻塞原因：${normalized.summary}`,
-          fv(fields, '当前阶段'));
+          fv(fields, '任务进展'));
 
         // 飞书通知
         await sendNotification(cfg,
@@ -702,7 +694,7 @@ export async function parseResult(raw, task, subtask, cfg) {
           await markDone(cfg, recordId, normalized.summary);
           await writeLog(cfg, recordId, '🏁 里程碑',
             `完成（状态=${normalized.status}）：${normalized.summary}`,
-            fv(fields, '当前阶段'));
+            fv(fields, '任务进展'));
         }
       }
     }

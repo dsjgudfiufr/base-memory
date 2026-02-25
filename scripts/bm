@@ -144,7 +144,7 @@ def print_task_line(rec):
     name = fv(f, '任务名称', truncate=30)
     status   = fv(f, '状态')
     priority = fv(f, '优先级')
-    phase = fv(f, '当前阶段', truncate=20)
+    phase = fv(f, '任务进展', truncate=20)
     summary = fv(f, '结果摘要', truncate=40)
     display_note = phase or summary
     err_cnt = f.get('错误次数')
@@ -176,7 +176,7 @@ def print_task_detail(rec):
           f"优先级: {fmt_priority(fv(f,'优先级'))}  "
           f"序号: #{fv(f,'执行序号') or '-'}{err_str}")
     for key, label in [
-        ('当前阶段',   '📍 当前阶段'),
+        ('任务进展',   '📍 任务进展'),
     ]:
         v = fv(f, key)
         if v: print(f"  {label}: {c(C.CYAN, v[:120])}")
@@ -316,7 +316,7 @@ def task_add(args):
         '状态':        '🔄 进行中',
         '优先级':      priority,
         '开始执行时间': now_ms,   # 任务启动时刻（不同于创建时间）
-        '当前阶段':    '阶段1-需求探索',  # 建立时自动设初始阶段，Base立即可见
+        '任务进展':    '阶段1-需求探索',  # 建立时自动设初始阶段，Base立即可见
     }
     if args.instruction: fields['原始指令'] = args.instruction
     # ── 父任务：子任务内联模式（方案A：不建独立行）────────────────
@@ -338,12 +338,12 @@ def task_add(args):
             new_plan = current_plan.rstrip() + f' → {args.name}'
         else:
             new_plan = f'子任务：{args.name}'
-        # 当前阶段指向第一个子任务（如果还没开始）
-        phase = fv(pf, '当前阶段') or ''
+        # 任务进展指向第一个子任务（如果还没开始）
+        phase = fv(pf, '任务进展') or ''
         if not phase or phase == '阶段1-需求探索':
             phase = f'📍{args.name}：待开始'
         api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.parent}',
-            {'fields': {'任务进展': new_plan, '当前阶段': phase}})
+            {'fields': {'任务进展': new_plan, '任务进展': phase}})
         ok(f'子任务已添加到父任务行')
         print(f"   {c(C.WHITE, args.name)}")
         print(f"   {c(C.GRAY, '↳ 父任务:')} {c(C.CYAN, args.parent)}")
@@ -386,7 +386,7 @@ def _show_next_tasks(c_):
             {'field_name': '状态', 'operator': 'is', 'value': ['🚧 阻塞中']},
         ]},
         'sort': [{'field_name': '执行序号', 'desc': False}],
-        'field_names': ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数'],
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数'],
         'page_size': 5
     })
     items = r.get('data', {}).get('items', [])
@@ -399,7 +399,7 @@ def _show_next_tasks(c_):
     nid = nxt['record_id']
     nname = fv(nf, '任务名称', 40)
     npri = fv(nf, '优先级')
-    nphase = fv(nf, '当前阶段')
+    nphase = fv(nf, '任务进展')
     hint = f'  [{nphase}]' if nphase else ''
     total = len(items)
     more = f'（共 {total} 个待处理）' if total > 1 else ''
@@ -487,7 +487,7 @@ def task_done(args):
     c_ = cfg()
     table_id = c_['tables']['tasks']['id']
     now_ms = int(time.time() * 1000)
-    done_fields = {'状态': '✅ 已完成', '完成时间': now_ms, '当前阶段': '✅ 交付完成'}
+    done_fields = {'状态': '✅ 已完成', '完成时间': now_ms, '任务进展': '✅ 交付完成'}
     # 读取当前记录
     rec = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}')
     rec_fields = rec.get('data', {}).get('record', {}).get('fields', {})
@@ -629,10 +629,10 @@ def task_interrupt(args):
         err(f'找不到任务: {args.id}')
     f = rec['data']['record']['fields']
     name = fv(f, '任务名称')
-    phase = fv(f, '当前阶段') or '未设置'
+    phase = fv(f, '任务进展') or '未设置'
     note = args.note or '手动打断，待恢复'
     # 写 checkpoint 日志
-    checkpoint_content = f'[打断断点]\n当前阶段：{phase}\n恢复提示：{note}'
+    checkpoint_content = f'[打断断点]\n任务进展：{phase}\n恢复提示：{note}'
     api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table}/records',
         {'fields': {
             '内容': checkpoint_content,
@@ -670,7 +670,7 @@ def task_ls(args):
         'filter': {'conjunction': 'or' if len(conditions)>1 else 'and', 'conditions': conditions},
         'sort': [{'field_name': '优先级', 'desc': False},
                  {'field_name': '执行序号', 'desc': False}],
-        'field_names': ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '结果摘要', '错误次数']
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '结果摘要', '错误次数']
     })
     label = '、'.join(statuses)
     print(f'\n{c(C.BOLD, "📋 任务列表")}  {c(C.GRAY, label)}  ({len(recs)} 个)\n')
@@ -719,7 +719,7 @@ def task_resume(args):
         print(f"  {fmt_status(fv(f,'状态'))}  {fmt_priority(fv(f,'优先级'))}")
         print()
         # 5问
-        phase    = fv(f, '当前阶段') or '未设置'
+        phase    = fv(f, '任务进展') or '未设置'
         goal     = fv(f, '原始指令', truncate=120) or fv(f, '任务名称')
 
         print(f"  {c(C.BOLD,'📍 我在哪里？')}  {c(C.CYAN, phase)}")
@@ -751,11 +751,11 @@ def task_resume(args):
     hr()
 
 def task_phase(args):
-    """快速更新当前阶段"""
+    """快速更新任务进展"""
     c_ = cfg()
     table_id = c_['tables']['tasks']['id']
     r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}',
-        {'fields': {'当前阶段': args.phase}})
+        {'fields': {'任务进展': args.phase}})
     if r.get('code') == 0:
         ok(f'阶段已更新: {args.phase}')
         _interrupt_check(c_, args.id)
@@ -798,7 +798,7 @@ def task_next(args):
             {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
             {'field_name': '状态', 'operator': 'is', 'value': ['⏸️ 已暂停']},
         ]},
-        'field_names': ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数'],
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数'],
         'page_size': 50
     })
     if not candidates:
@@ -820,7 +820,7 @@ def task_next(args):
     top_name = fv(tf, '任务名称')
     top_pri  = fv(tf, '优先级')
     top_sta  = fv(tf, '状态')
-    top_phase = fv(tf, '当前阶段') or ''
+    top_phase = fv(tf, '任务进展') or ''
 
     print(f'\n{c(C.BOLD, "🎯 调度建议")}\n')
 
@@ -882,7 +882,7 @@ def task_next(args):
             sta = fv(f, '状态')
             pri = fv(f, '优先级')
             name = fv(f, '任务名称', 25)
-            phase = fv(f, '当前阶段', 15) or ''
+            phase = fv(f, '任务进展', 15) or ''
             marker = c(C.GREEN, '▶') if sta == '🔄 进行中' else c(C.GRAY, f'{i+1}.')
             phase_str = c(C.GRAY, f' [{phase}]') if phase else ''
             print(f'  {marker} {fmt_priority(pri)}  {c(C.WHITE, name)}{phase_str}')
@@ -918,7 +918,7 @@ def subtask_add_batch(args):
 
     phase = f'📍{names[0]}：待开始'
     api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
-        {'fields': {'任务进展': new_plan, '当前阶段': phase}})
+        {'fields': {'任务进展': new_plan, '任务进展': phase}})
 
     ok(f'批量添加 {len(names)} 个子任务 → {c(C.GRAY, parent_id)}')
     print(f'   {c(C.CYAN, "子任务：")} {c(C.WHITE, " → ".join(names))}')
@@ -983,14 +983,14 @@ def subtask_done(args):
     total_count = len(subtasks)
     all_done = done_count == total_count
 
-    # 更新当前阶段
+    # 更新任务进展
     if all_done:
         phase = '✅ 全部完成'
     else:
         next_sub = next((s for s in subtasks if f'✅{s}' not in new_plan), None)
         phase = f'📍{next_sub}' if next_sub else '✅ 全部完成'
 
-    update_fields = {'任务进展': new_plan, '当前阶段': phase}
+    update_fields = {'任务进展': new_plan, '任务进展': phase}
 
     # 写 milestone 日志
     api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records',
@@ -1038,7 +1038,7 @@ def subtask_done(args):
 
 def subtask_phase(args):
     """bm subtask phase <parent_id> <subtask_name> <step>
-    更新「当前阶段」为指定子任务的当前步骤。
+    更新「任务进展」为指定子任务的当前步骤。
     """
     c_ = cfg()
     table_id = c_['tables']['tasks']['id']
@@ -1058,12 +1058,12 @@ def subtask_phase(args):
     if subtask_name not in subtasks:
         err(f'子任务「{subtask_name}」未找到\n当前子任务: {", ".join(subtasks)}')
 
-    # 只更新当前阶段
+    # 只更新任务进展
     phase = f'📍{subtask_name}：{step}'
     r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
-        {'fields': {'当前阶段': phase}})
+        {'fields': {'任务进展': phase}})
     if r.get('code') == 0:
-        ok(f'当前阶段已更新')
+        ok(f'任务进展已更新')
         print(f"   {c(C.CYAN, '📍')} {c(C.WHITE, f'{subtask_name}：{step}')}")
     else:
         err(f'更新失败: {r.get("msg")}')
@@ -1249,8 +1249,8 @@ def log_add(args):
 
         if args.phase:
             api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}',
-                {'fields': {'当前阶段': args.phase}})
-            print(f"   {c(C.CYAN, '📍 当前阶段 →')} {c(C.WHITE, args.phase)}")
+                {'fields': {'任务进展': args.phase}})
+            print(f"   {c(C.CYAN, '📍 任务进展 →')} {c(C.WHITE, args.phase)}")
 
         if is_error and new_error_count is not None:
             remaining = MAX_ERROR_RETRIES - new_error_count
@@ -1451,7 +1451,7 @@ def _build_dispatch_prompt(task_rec, subtask_name, c_):
     name = fv(f, '任务名称')
     instruction = fv(f, '原始指令')
     plan = fv(f, '任务进展')
-    phase = fv(f, '当前阶段')
+    phase = fv(f, '任务进展')
 
     # 解析子任务进度
     subtasks = _parse_subtasks(plan) if plan else []
@@ -1558,7 +1558,7 @@ def dispatch_prep(args):
             {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
             {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
         ]},
-        'field_names': ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数', '任务进展', '原始指令'],
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数', '任务进展', '原始指令'],
         'page_size': 50
     })
     if not candidates:
@@ -1626,7 +1626,7 @@ def dispatch_status(args):
         'filter': {'conjunction': 'and', 'conditions': [
             {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
         ]},
-        'field_names': ['任务名称', '优先级', '当前阶段', '错误次数'],
+        'field_names': ['任务名称', '优先级', '任务进展', '错误次数'],
         'page_size': 10
     })
     if not recs:
@@ -1638,7 +1638,7 @@ def dispatch_status(args):
         rid = r.get('record_id', '')
         name = fv(f, '任务名称', 30)
         pri = fv(f, '优先级')
-        phase = fv(f, '当前阶段', 30)
+        phase = fv(f, '任务进展', 30)
         print(f'  {fmt_priority(pri)}  {c(C.WHITE, name)}')
         if phase:
             print(f'    {c(C.GRAY, f"📍 {phase}")}')
@@ -1795,7 +1795,7 @@ def main():
     p.add_argument('id', help='record_id')
 
     # task phase
-    p = task_sub.add_parser('phase', help='更新当前阶段')
+    p = task_sub.add_parser('phase', help='更新任务进展')
     p.add_argument('id', help='record_id')
     p.add_argument('phase', help='阶段名称（如：阶段2-实现）')
 
@@ -1815,7 +1815,7 @@ def main():
     p.add_argument('-s', '--summary', default='', metavar='摘要', help='完成摘要')
 
     # subtask phase
-    p = subtask_sub.add_parser('phase', help='更新子任务当前步骤（更新「当前阶段」字段）')
+    p = subtask_sub.add_parser('phase', help='更新子任务当前步骤（更新「任务进展」字段）')
     p.add_argument('parent_id', help='父任务 record_id')
     p.add_argument('subtask_name', help='子任务名称')
     p.add_argument('step', help='当前步骤描述，如"阶段2-代码实现（下一步：写单测）"')
@@ -1834,7 +1834,7 @@ def main():
     p.add_argument('task_id', help='关联任务 record_id')
     p.add_argument('type', help='类型: plan|finding|error|decision|milestone|progress|tool')
     p.add_argument('content', help='内容')
-    p.add_argument('--phase', default='', metavar='阶段', help='当前阶段')
+    p.add_argument('--phase', default='', metavar='阶段', help='任务进展')
     p.add_argument('--attempt', type=int, default=0, metavar='N', help='尝试次数（用于错误追踪）')
     p.add_argument('--file', default='', metavar='路径', help='附件文件路径（截图/大文件）')
 
