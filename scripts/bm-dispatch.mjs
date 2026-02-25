@@ -11,7 +11,7 @@
  *   import { dispatch, dispatchOnce } from './bm-dispatch.mjs'
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, unlinkSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -699,62 +699,164 @@ export async function parseResult(raw, task, subtask, cfg) {
   return normalized;
 }
 
-// ── LLM 调用 ─────────────────────────────────────────────────────
+// ── LLM 调用（通过 OpenClaw sessions_spawn）──────────────────────
 
 async function callLLM(prompt) {
-  // 从 openclaw.json 读取 LLM 配置，直接调 API（同步等待结果）
-  let baseUrl, apiKey, model;
-  try {
-    const oc = loadOpenClawConfig();
-    // 优先用环境变量
-    baseUrl = process.env.LLM_BASE_URL;
-    apiKey = process.env.LLM_API_KEY;
-    model = process.env.LLM_MODEL;
+  return callLLMViaSpawn(prompt);
+}
 
-    if (!baseUrl || !apiKey) {
-      // 从 openclaw.json 读取第一个自定义 provider
-      const providers = oc.models?.providers || {};
-      for (const [name, p] of Object.entries(providers)) {
-        if (p.baseUrl && p.apiKey) {
-          baseUrl = p.baseUrl;
-          apiKey = p.apiKey;
-          model = model || p.models?.[0]?.id || 'claude-sonnet-4-6';
-          break;
-        }
-      }
-    }
-  } catch {}
+/**
+ * 通过 OpenClaw /hooks/agent 触发隔离 session（等同于 sessions_spawn）。
+ * Agent 在隔离 session 里运行，有完整工具权限。
+ *
+ * 结果获取策略（双通道，提高可靠性）：
+ * 1. 主通道：约定结果文件（agent 写入 /tmp/bm-dispatch-result-<ts>.json）
+ * 2. 备用通道：轮询 session transcript，从最后一条 assistant 消息提取结果
+ */
+async function callLLMViaSpawn(prompt) {
+  const oc = loadOpenClawConfig();
+  const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN || oc.hooks?.token || '';
+  const port = OPENCLAW_PORT;
 
-  if (!baseUrl || !apiKey) {
-    throw new Error('未找到 LLM 配置，请设置 LLM_BASE_URL + LLM_API_KEY 或配置 openclaw.json models.providers');
+  if (!hooksToken) {
+    throw new Error('未找到 hooks token，请设置 OPENCLAW_HOOKS_TOKEN 或配置 openclaw.json hooks.token');
   }
 
-  model = model || 'claude-sonnet-4-6';
-  log('🤖', `调用 LLM: ${model} via ${baseUrl}`);
+  // 用时间戳生成唯一标识
+  const dispatchId = Date.now();
+  const resultFile = `/tmp/bm-dispatch-result-${dispatchId}.json`;
+  const sessionName = `dispatch-${dispatchId}`;
 
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+  // 在 prompt 末尾追加结果文件指令
+  const augmentedPrompt = `${prompt}
+
+## ⚠️ 重要：结果输出方式
+除了在对话中输出结果 JSON，你还必须把结果 JSON 写入文件：
+\`\`\`bash
+echo '{"status":"done","summary":"你的摘要","files":[]}' > ${resultFile}
+\`\`\`
+如果失败：
+\`\`\`bash
+echo '{"status":"error","message":"错误描述"}' > ${resultFile}
+\`\`\`
+如果阻塞：
+\`\`\`bash
+echo '{"status":"blocked","reason":"阻塞原因"}' > ${resultFile}
+\`\`\`
+这是必须的，调度器依赖这个文件获取你的执行结果。`;
+
+  log('🤖', `触发 sessions_spawn (hooks/agent), id: ${dispatchId}`);
+
+  const res = await fetch(`http://localhost:${port}/hooks/agent`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
+      'Authorization': `Bearer ${hooksToken}`,
     },
     body: JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 4096,
+      message: augmentedPrompt,
+      name: sessionName,
+      deliver: false,
+      timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
     }),
-    signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
   });
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`LLM HTTP ${res.status}: ${text.slice(0, 200)}`);
+    throw new Error(`sessions_spawn HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
 
-  const data = await res.json();
-  const output = data.choices?.[0]?.message?.content || JSON.stringify(data);
-  log('📥', `LLM 返回 ${output.length} 字符`);
-  return output;
+  const hookResult = await res.json();
+  const runId = hookResult.runId;
+  log('📋', `runId: ${runId}, 轮询结果...`);
+
+  // 双通道轮询
+  const startTime = Date.now();
+  const pollInterval = 3000;
+  const maxWait = LLM_TIMEOUT_MS;
+
+  while (Date.now() - startTime < maxWait) {
+    await new Promise(r => setTimeout(r, pollInterval));
+
+    // 通道1：检查结果文件
+    try {
+      if (existsSync(resultFile)) {
+        const content = readFileSync(resultFile, 'utf-8').trim();
+        if (content) {
+          log('📥', `结果文件就绪 (${Math.round((Date.now() - startTime) / 1000)}s)`);
+          try { unlinkSync(resultFile); } catch {}
+          return content;
+        }
+      }
+    } catch {}
+
+    // 通道2：轮询 session transcript（每 15s 一次，减少 IO）
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    if (elapsed > 10 && elapsed % 15 === 0) {
+      log('⏳', `等待完成... ${elapsed}s`);
+      try {
+        const transcriptResult = await pollTranscriptForResult(sessionName);
+        if (transcriptResult) {
+          log('📥', `从 transcript 获取结果 (${elapsed}s)`);
+          try { unlinkSync(resultFile); } catch {}
+          return transcriptResult;
+        }
+      } catch (err) {
+        if (elapsed % 30 === 0) log('⚠️', `transcript 轮询: ${err.message}`);
+      }
+    }
+  }
+
+  // 超时
+  try { unlinkSync(resultFile); } catch {}
+  throw new Error(`sessions_spawn 超时 (${Math.floor(maxWait / 1000)}s)`);
+}
+
+/**
+ * 从 session transcript 文件中提取最后一条 assistant 消息。
+ * 通过 sessions.json 查找匹配的 session，读取 .jsonl transcript。
+ */
+async function pollTranscriptForResult(sessionName) {
+  const sessionsFile = resolve(process.env.HOME, '.openclaw/agents/main/sessions/sessions.json');
+  if (!existsSync(sessionsFile)) return null;
+
+  const sessions = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
+
+  // 查找包含 dispatch 名称的 session
+  let targetSessionId = null;
+  for (const [key, entry] of Object.entries(sessions)) {
+    if (key.includes(sessionName) || (entry.summary && entry.summary.includes(sessionName))) {
+      targetSessionId = entry.sessionId;
+      break;
+    }
+  }
+
+  if (!targetSessionId) return null;
+
+  const transcriptPath = resolve(
+    process.env.HOME,
+    `.openclaw/agents/main/sessions/${targetSessionId}.jsonl`
+  );
+  if (!existsSync(transcriptPath)) return null;
+
+  const lines = readFileSync(transcriptPath, 'utf-8').trim().split('\n');
+
+  // 从后往前找最后一条 assistant 消息
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const msg = JSON.parse(lines[i]);
+      if (msg.role === 'assistant' && msg.content) {
+        const content = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.map(b => b.text || '').join('')
+            : '';
+        if (content.trim()) return content.trim();
+      }
+    } catch {}
+  }
+
+  return null;
 }
 
 // ── 单轮调度 ─────────────────────────────────────────────────────
