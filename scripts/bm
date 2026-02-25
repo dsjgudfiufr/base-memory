@@ -180,10 +180,10 @@ def print_task_detail(rec):
     ]:
         v = fv(f, key)
         if v: print(f"  {label}: {c(C.CYAN, v[:120])}")
-    # 任务规划
-    plan = fv(f, '任务规划')
+    # 任务进展
+    plan = fv(f, '任务进展')
     if plan:
-        print(f"\n  {c(C.BOLD, '📋 任务规划')}:")
+        print(f"\n  {c(C.BOLD, '📋 任务进展')}:")
         for line in plan[:400].replace('\\n', '\n').split('\n'):
             if not line.strip(): continue
             print(f"    {c(C.BLUE, line.strip())}")
@@ -328,8 +328,8 @@ def task_add(args):
         pstatus = fv(pf, '状态')
         if pstatus == '✅ 已完成':
             warn(f'父任务已完成！建议确认是否要在已关闭的任务下创建子任务。')
-        # 追加子任务名到「任务规划」字段
-        current_plan = fv(pf, '任务规划') or ''
+        # 追加子任务名到「任务进展」字段
+        current_plan = fv(pf, '任务进展') or ''
         if current_plan and '子任务：' not in current_plan:
             # 第一次加子任务，追加子任务段落
             new_plan = current_plan.rstrip() + f'\n子任务：{args.name}'
@@ -343,7 +343,7 @@ def task_add(args):
         if not phase or phase == '阶段1-需求探索':
             phase = f'📍{args.name}：待开始'
         api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.parent}',
-            {'fields': {'任务规划': new_plan, '当前阶段': phase}})
+            {'fields': {'任务进展': new_plan, '当前阶段': phase}})
         ok(f'子任务已添加到父任务行')
         print(f"   {c(C.WHITE, args.name)}")
         print(f"   {c(C.GRAY, '↳ 父任务:')} {c(C.CYAN, args.parent)}")
@@ -905,7 +905,7 @@ def subtask_add_batch(args):
     if fv(pf, '状态') == '✅ 已完成':
         warn('父任务已完成！')
 
-    current_plan = fv(pf, '任务规划') or ''
+    current_plan = fv(pf, '任务进展') or ''
     if '子任务：' in current_plan:
         # 已有子任务行：直接替换（不追加），避免 log add plan 和 subtask add 双写导致重复
         idx = current_plan.find('子任务：')
@@ -918,7 +918,7 @@ def subtask_add_batch(args):
 
     phase = f'📍{names[0]}：待开始'
     api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
-        {'fields': {'任务规划': new_plan, '当前阶段': phase}})
+        {'fields': {'任务进展': new_plan, '当前阶段': phase}})
 
     ok(f'批量添加 {len(names)} 个子任务 → {c(C.GRAY, parent_id)}')
     print(f'   {c(C.CYAN, "子任务：")} {c(C.WHITE, " → ".join(names))}')
@@ -929,7 +929,7 @@ def subtask_add_batch(args):
 
 
 def _parse_subtasks(plan_txt):
-    """从任务规划字段解析子任务名称列表"""
+    """从任务进展字段解析子任务名称列表"""
     # 处理字面量 \n 和真正的换行
     lines = plan_txt.replace('\\n', '\n').split('\n')
     for line in lines:
@@ -957,11 +957,11 @@ def subtask_done(args):
         err(f'父任务 {parent_id} 不存在')
     pf = pr['data']['record']['fields']
 
-    # 从「任务规划」字段解析子任务列表
-    plan_txt = fv(pf, '任务规划') or ''
+    # 从「任务进展」字段解析子任务列表
+    plan_txt = fv(pf, '任务进展') or ''
     subtasks = _parse_subtasks(plan_txt)
     if not subtasks:
-        err(f'父任务没有子任务（任务规划中未找到"子任务："段落）')
+        err(f'父任务没有子任务（任务进展中未找到"子任务："段落）')
 
     if subtask_name not in subtasks:
         err(f'子任务「{subtask_name}」未找到\n当前子任务: {", ".join(subtasks)}')
@@ -990,7 +990,7 @@ def subtask_done(args):
         next_sub = next((s for s in subtasks if f'✅{s}' not in new_plan), None)
         phase = f'📍{next_sub}' if next_sub else '✅ 全部完成'
 
-    update_fields = {'任务规划': new_plan, '当前阶段': phase}
+    update_fields = {'任务进展': new_plan, '当前阶段': phase}
 
     # 写 milestone 日志
     api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records',
@@ -1053,7 +1053,7 @@ def subtask_phase(args):
     pf = pr['data']['record']['fields']
 
     # 验证子任务存在
-    plan_txt = fv(pf, '任务规划') or ''
+    plan_txt = fv(pf, '任务进展') or ''
     subtasks = _parse_subtasks(plan_txt)
     if subtask_name not in subtasks:
         err(f'子任务「{subtask_name}」未找到\n当前子任务: {", ".join(subtasks)}')
@@ -1174,8 +1174,8 @@ def log_add(args):
         state = _load_state()
         plan_key = f'has_plan_{args.task_id}'
         if not state.get(plan_key):
-            # 检查任务表「任务规划」字段是否有内容（已在 task_fields 里，不需要额外 API）
-            has_plan = bool(fv(task_fields, '任务规划'))
+            # 检查任务表「任务进展」字段是否有内容（已在 task_fields 里，不需要额外 API）
+            has_plan = bool(fv(task_fields, '任务进展'))
             if has_plan:
                 state[plan_key] = True
                 _save_state(state)
@@ -1211,13 +1211,13 @@ def log_add(args):
         if not task_fields:
             warn(f'读取任务记录失败，错误次数不自动更新')
 
-    # ── 写入 Base 执行日志表（plan 类型同时写任务表「任务规划」）──
+    # ── 写入 Base 执行日志表（plan 类型同时写任务表「任务进展」）──
     PLAN_TYPE = LOG_TYPE_MAP.get('plan', '📋 计划')
     if ltype == PLAN_TYPE:
         plan_content = content_text[:300]
         api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}',
-            {'fields': {'任务规划': plan_content}})
-        print(f"   {c(C.BLUE, '📋 规划 →')} 任务表「任务规划」字段")
+            {'fields': {'任务进展': plan_content}})
+        print(f"   {c(C.BLUE, '📋 规划 →')} 任务表「任务进展」字段")
         # 缓存：标记该任务已有 plan
         state = _load_state()
         state[f'has_plan_{args.task_id}'] = True
@@ -1450,7 +1450,7 @@ def _build_dispatch_prompt(task_rec, subtask_name, c_):
     record_id = task_rec.get('record_id', '')
     name = fv(f, '任务名称')
     instruction = fv(f, '原始指令')
-    plan = fv(f, '任务规划')
+    plan = fv(f, '任务进展')
     phase = fv(f, '当前阶段')
 
     # 解析子任务进度
@@ -1558,7 +1558,7 @@ def dispatch_prep(args):
             {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
             {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
         ]},
-        'field_names': ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数', '任务规划', '原始指令'],
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数', '任务进展', '原始指令'],
         'page_size': 50
     })
     if not candidates:
@@ -1578,7 +1578,7 @@ def dispatch_prep(args):
     record_id = task.get('record_id', '')
     name = fv(f, '任务名称')
     priority = fv(f, '优先级')
-    plan_txt = fv(f, '任务规划')
+    plan_txt = fv(f, '任务进展')
     error_count = int(float(fv(f, '错误次数') or '0'))
 
     # 检查错误次数

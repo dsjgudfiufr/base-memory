@@ -163,7 +163,7 @@ async function fetchNextTask(cfg) {
         { field_name: '状态', operator: 'is', value: ['🕐 待开始'] },
       ],
     },
-    field_names: ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数', '任务规划', '原始指令'],
+    field_names: ['任务名称', '状态', '优先级', '执行序号', '当前阶段', '错误次数', '任务进展', '原始指令'],
     page_size: 50,
   });
 
@@ -238,7 +238,7 @@ async function markSubtaskDone(cfg, recordId, subtaskName, summary) {
   const rec = await getRecord(app_token, tableId, recordId);
   if (!rec) return;
 
-  let planText = fv(rec.fields, '任务规划') || '';
+  let planText = fv(rec.fields, '任务进展') || '';
   const subtasks = parseSubtasks(planText);
 
   // 标记完成
@@ -247,7 +247,7 @@ async function markSubtaskDone(cfg, recordId, subtaskName, summary) {
   const doneCount = subtasks.filter(s => planText.includes(`✅${s}`)).length;
   const allDone = doneCount === subtasks.length;
 
-  const fields = { '任务规划': planText };
+  const fields = { '任务进展': planText };
   if (allDone) {
     fields['状态'] = '✅ 已完成';
     fields['完成时间'] = Date.now();
@@ -358,7 +358,7 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
   const recordId = taskRecord.record_id;
   const name = fv(fields, '任务名称');
   const instruction = fv(fields, '原始指令');
-  const plan = fv(fields, '任务规划');
+  const plan = fv(fields, '任务进展');
   const phase = fv(fields, '当前阶段');
 
   // ── 解析子任务进度 ──────────────────────────────────────────────
@@ -929,7 +929,7 @@ export async function dispatchOnce(opts = {}) {
   const fields = task.fields || {};
   const taskName = fv(fields, '任务名称');
   const priority = fv(fields, '优先级');
-  let planText = fv(fields, '任务规划');
+  let planText = fv(fields, '任务进展');
   const errorCount = parseInt(fv(fields, '错误次数') || '0', 10);
 
   log('🎯', `调度任务: ${priority} ${taskName}`);
@@ -950,7 +950,7 @@ export async function dispatchOnce(opts = {}) {
   if (!planText) {
     log('📝', '开始规划...');
     try {
-      await updateField(cfg, recordId, '当前阶段', '📝 规划中...');
+      await updateField(cfg, recordId, '任务进展', '📝 规划中...');
       const planResult = await planTask(task, cfg);
       planText = planResult.plan || `目标：${taskName}`;
       subtasks = planResult.subtasks || [];
@@ -960,7 +960,7 @@ export async function dispatchOnce(opts = {}) {
       }
 
       // 代码写表：任务规划
-      await updateField(cfg, recordId, '任务规划', planText);
+      await updateField(cfg, recordId, '任务进展', planText);
       log('📋', `规划完成: ${subtasks.length} 个子任务`);
     } catch (err) {
       log('⚠️', `规划失败: ${err.message}，直接执行`);
@@ -996,10 +996,9 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
       return `○${s}`;
     }).join(' → ');
 
-    // 代码写表：当前阶段 + 任务规划进度
-    await updateField(cfg, recordId, '当前阶段', `📍 ${subtaskName} (${i + 1}/${allSubtasks.length})`);
-    const updatedPlan = planText.replace(/子任务：.*/, `子任务：${progressLine}`);
-    await updateField(cfg, recordId, '任务规划', updatedPlan);
+    // 代码写表：任务进展（合并进度信息）
+    const progressText = `${planText.split('\n')[0]}\n📍 ${subtaskName} (${i + 1}/${allSubtasks.length})\n${progressLine}`;
+    await updateField(cfg, recordId, '任务进展', progressText);
     log('📍', `子任务 ${i + 1}/${allSubtasks.length}: ${subtaskName}`);
 
     // 构建子任务 prompt（含前序结果）
@@ -1028,7 +1027,7 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
 
     if (result.status === 'blocked') {
       await updateField(cfg, recordId, '状态', '🔒阻塞');
-      await updateField(cfg, recordId, '当前阶段', `🔒 ${subtaskName} 阻塞: ${result.reason || ''}`);
+      await updateField(cfg, recordId, '任务进展', `🔒 ${subtaskName} 阻塞: ${result.reason || ''}`);
       return { taskId: recordId, status: 'blocked', summary: result.reason };
     }
 
@@ -1039,10 +1038,9 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
 
   // 全部子任务完成
   const finalProgress = allSubtasks.map(s => `✅${s}`).join(' → ');
-  const finalPlan = planText.replace(/子任务：.*/, `子任务：${finalProgress}`);
   const finalSummary = completedResults.map(r => r.summary).join('; ').slice(0, 200);
 
-  await updateField(cfg, recordId, '任务规划', finalPlan);
+  await updateField(cfg, recordId, '任务进展', `✅ 全部完成\n${finalProgress}`);
   await markDone(cfg, recordId, finalSummary);
   log('🎉', `任务完成: ${allSubtasks.length} 个子任务全部完成`);
 
@@ -1055,7 +1053,7 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
 async function executeSingle(task, cfg) {
   const recordId = task.record_id;
 
-  await updateField(cfg, recordId, '当前阶段', '🔄 执行中...');
+  await updateField(cfg, recordId, '任务进展', '🔄 执行中...');
 
   const prompt = await buildPrompt(task, null, cfg);
 
