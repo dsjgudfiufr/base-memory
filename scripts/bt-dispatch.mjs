@@ -2,7 +2,7 @@
 /**
  * bt-dispatch.mjs — 代码驱动的任务调度器核心循环
  *
- * 独立 Node 进程：循环查 Bitable 任务表 → 拼 prompt → spawn LLM session
+ * 独立 Node 进程：循环查 Base 任务表 → 拼 prompt → spawn LLM session
  * → 等结果 → 解析结果写表 → 下一个任务。
  *
  * 用法:
@@ -21,11 +21,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const OPENCLAW_PORT = process.env.OPENCLAW_PORT || 18789;
 const OPENCLAW_CONFIG = process.env.OPENCLAW_CONFIG || resolve(process.env.HOME, '.openclaw/openclaw.json');
-const CONFIG_FILE = resolve(__dirname, 'bitable_config.json');
-// 如果 scripts 目录下没有 config，回退到上级 scripts/bitable_config.json
+const CONFIG_FILE = resolve(__dirname, 'base_config.json');
+// 如果 scripts 目录下没有 config，回退到上级 scripts/base_config.json
 const CONFIG_PATH = existsSync(CONFIG_FILE)
   ? CONFIG_FILE
-  : resolve(__dirname, '../../scripts/bitable_config.json');
+  : resolve(__dirname, '../../scripts/base_config.json');
 
 const MAX_ERROR_RETRIES = parseInt(process.env.BT_MAX_ERROR_RETRIES || '5', 10);
 const POLL_INTERVAL_MS = parseInt(process.env.BT_POLL_INTERVAL_MS || '30000', 10); // 主循环间隔
@@ -89,7 +89,7 @@ async function api(method, path, body) {
   return fetchJSON(method, url, body, { Authorization: `Bearer ${token}` });
 }
 
-// ── Bitable 辅助 ─────────────────────────────────────────────────
+// ── Base 辅助 ─────────────────────────────────────────────────
 
 function fv(fields, key) {
   const val = fields?.[key];
@@ -338,10 +338,10 @@ async function notifyOwner(cfg, taskId, taskName, errorCount, lastError) {
 // ── Prompt 构建 ──────────────────────────────────────────────────
 
 /**
- * 从 Bitable 读取任务完整信息，拼装 LLM prompt。
- * @param {object} taskRecord - Bitable 任务记录
+ * 从 Base 读取任务完整信息，拼装 LLM prompt。
+ * @param {object} taskRecord - Base 任务记录
  * @param {string|null} subtaskName - 当前子任务名（无子任务时为 null）
- * @param {object} cfg - bitable_config
+ * @param {object} cfg - base_config
  * @returns {Promise<string>} prompt 文本
  */
 export async function buildPrompt(taskRecord, subtaskName, cfg) {
@@ -467,7 +467,7 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
   return parts.join('\n\n');
 }
 
-// ── 结果解析 + Bitable 写入 ──────────────────────────────────────
+// ── 结果解析 + Base 写入 ──────────────────────────────────────
 
 /**
  * 从 LLM 原始输出中提取结构化 JSON。
@@ -576,12 +576,12 @@ async function writeLog(cfg, recordId, type, content, phase) {
 }
 
 /**
- * 解析 LLM 返回结果并更新 Bitable。
+ * 解析 LLM 返回结果并更新 Base。
  *
  * @param {string} raw - LLM 原始输出
- * @param {object} task - Bitable 任务记录 { record_id, fields }
+ * @param {object} task - Base 任务记录 { record_id, fields }
  * @param {string|null} subtask - 当前子任务名（无子任务时为 null）
- * @param {object} cfg - bitable_config
+ * @param {object} cfg - base_config
  * @returns {Promise<{ status: string, summary: string, files: string[] }>}
  */
 export async function parseResult(raw, task, subtask, cfg) {
@@ -692,7 +692,7 @@ export async function parseResult(raw, task, subtask, cfg) {
       }
     }
   } catch (err) {
-    log('⚠️', `parseResult Bitable 写入失败: ${err.message}`);
+    log('⚠️', `parseResult Base 写入失败: ${err.message}`);
     // 写入失败不影响返回解析结果
   }
 
@@ -734,7 +734,7 @@ async function callLLM(prompt) {
 /**
  * 执行一轮调度：取最高优先级任务 → 执行 → 更新结果。
  * @param {object} [opts] - 选项
- * @param {object} [opts.config] - 覆盖 bitable_config
+ * @param {object} [opts.config] - 覆盖 base_config
  * @param {boolean} [opts.dryRun] - 只打印不执行 LLM
  * @returns {{ taskId: string, status: string, summary: string } | null}
  */
@@ -781,7 +781,7 @@ export async function dispatchOnce(opts = {}) {
     return { taskId: recordId, status: blocked ? 'blocked' : 'error', summary: err.message };
   }
 
-  // 解析结果 + 写入 Bitable（parseResult 内部处理所有状态更新）
+  // 解析结果 + 写入 Base（parseResult 内部处理所有状态更新）
   const result = await parseResult(rawOutput, task, subtaskName, cfg);
   log('📊', `结果: status=${result.status}, summary=${(result.summary || '').slice(0, 80)}`);
 
@@ -793,7 +793,7 @@ export async function dispatchOnce(opts = {}) {
 /**
  * 持续调度循环。
  * @param {object} [opts] - 选项
- * @param {object} [opts.config] - 覆盖 bitable_config
+ * @param {object} [opts.config] - 覆盖 base_config
  * @param {number} [opts.intervalMs] - 循环间隔（默认 30s）
  * @param {boolean} [opts.dryRun] - 只打印不执行 LLM
  * @param {AbortSignal} [opts.signal] - 用于外部停止循环

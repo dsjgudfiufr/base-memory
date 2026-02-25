@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bt - Bitable Memory CLI (AI Agent 外脑)
+bt - Base Memory CLI (AI Agent 外脑)
 用法:
   bt task add <名称> [-p 紧急|重要|普通] [-i "原始指令"]
   bt task done <id> [-t token数] [-s "结果摘要"]
@@ -20,7 +20,7 @@ from datetime import datetime
 
 # ── 配置 ──────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))  # 跟随 symlink 找真实路径
-CONFIG_FILE = os.path.join(SCRIPT_DIR, 'bitable_config.json')
+CONFIG_FILE = os.path.join(SCRIPT_DIR, 'base_config.json')
 OPENCLAW_CONFIG = os.environ.get('OPENCLAW_CONFIG', os.path.expanduser('~/.openclaw/openclaw.json'))
 MAX_ERROR_RETRIES = int(os.environ.get('BT_MAX_ERROR_RETRIES', '5'))
 OWNER_OPEN_ID = os.environ.get('BT_OWNER_OPEN_ID', '')  # Owner's Feishu open_id (for notifications)
@@ -317,7 +317,7 @@ def task_add(args):
         '状态':        '🔄 进行中',
         '优先级':      priority,
         '开始执行时间': now_ms,   # 任务启动时刻（不同于创建时间）
-        '当前阶段':    '阶段1-需求探索',  # 建立时自动设初始阶段，Bitable立即可见
+        '当前阶段':    '阶段1-需求探索',  # 建立时自动设初始阶段，Base立即可见
     }
     if args.instruction: fields['原始指令'] = args.instruction
     # ── 父任务：子任务内联模式（方案A：不建独立行）────────────────
@@ -1212,7 +1212,7 @@ def log_add(args):
         if not task_fields:
             warn(f'读取任务记录失败，错误次数不自动更新')
 
-    # ── 写入 Bitable 执行日志表（plan 类型同时写任务表「任务规划」）──
+    # ── 写入 Base 执行日志表（plan 类型同时写任务表「任务规划」）──
     PLAN_TYPE = LOG_TYPE_MAP.get('plan', '📋 计划')
     if ltype == PLAN_TYPE:
         plan_content = content_text[:300]
@@ -1447,13 +1447,13 @@ def log_search(args):
 def main():
     parser = argparse.ArgumentParser(
         prog='bt',
-        description=c(C.CYAN, 'bt — Bitable Memory CLI'),
+        description=c(C.CYAN, 'bt — Base Memory CLI'),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest='cmd', metavar='<命令>')
 
     # ── setup ──
-    setup_p = sub.add_parser('setup', help='初始化: 创建 Bitable 表结构并生成配置')
+    setup_p = sub.add_parser('setup', help='初始化: 创建 Base 表结构并生成配置')
     setup_p.add_argument('--app-token', help='已有的多维表格 app_token（不传则创建新的）')
 
     # ── task ──
@@ -1628,14 +1628,14 @@ def main():
 
     else:
         # 无参数时显示帮助 + 当前状态
-        print(f'\n{c(C.BOLD+C.CYAN, "🦞 bt — Bitable Memory CLI")}\n')
+        print(f'\n{c(C.BOLD+C.CYAN, "🦞 bt — Base Memory CLI")}\n')
         print(f'  {c(C.GRAY, "任务:    bt task add|done|up|block|interrupt|next|ls|resume|search|show|phase")}')
         subtask_hint = '子任务:  bt subtask done|phase <父ID> "子任务名"  （内联在父任务行）'
         print(f'  {c(C.GRAY, subtask_hint)}')
         print(f'  {c(C.GRAY, "日志:    bt log add|ls|search  （上下文卸载 + 跨任务搜索）")}')
         print(f'  {c(C.GRAY, "记忆:    bt mem add|ls|search  （长期知识沉淀）")}')
         
-        print(f'  {c(C.GRAY, "文档:  https://github.com/ponyobot/bitable-memory")}\n')
+        print(f'  {c(C.GRAY, "文档:  https://github.com/dsjgudfiufr/base-memory")}\n')
         # 快速显示进行中任务数
         try:
             c_ = cfg()

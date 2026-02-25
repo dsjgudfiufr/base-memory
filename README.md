@@ -1,12 +1,12 @@
-# 🧠 Bitable Memory — 飞书多维表格作为 AI Agent 外脑
+# 🧠 Base Memory — 飞书多维表格作为 AI Agent 外脑
 
-> 上下文窗口 = RAM（易失、有限）。Bitable = Disk（持久、无限）。
+> 上下文窗口 = RAM（易失、有限）。Base = Disk（持久、无限）。
 
 把飞书多维表格变成 AI Agent 的持久化大脑：**任务管理 + 执行日志 + 长期记忆**，一个 CLI 搞定。
 
 ## 为什么需要？
 
-AI Agent 的上下文窗口会丢失。每次新 session，之前的发现、决策、教训全部清零。Bitable Memory 解决这个问题：
+AI Agent 的上下文窗口会丢失。每次新 session，之前的发现、决策、教训全部清零。Base Memory 解决这个问题：
 
 - **任务表** — 记录目标、阶段、进度（像 `task_plan.md`）
 - **执行日志表** — 记录发现、决策、错误（像 `findings.md` + `progress.md`）
@@ -95,7 +95,7 @@ bt subtask done <父ID> "子任务A" -s "完成摘要"
 
 ## 配置
 
-`bt setup` 生成 `bitable_config.json`：
+`bt setup` 生成 `base_config.json`：
 
 ```json
 {
@@ -119,13 +119,13 @@ bt subtask done <父ID> "子任务A" -s "完成摘要"
 本项目同时是一个 [OpenClaw](https://github.com/openclaw/openclaw) Skill，可以直接安装：
 
 ```
-bitable-memory/
+base-memory/
 ├── SKILL.md              # Skill 描述（给 Agent 看的操作指南）
 ├── README.md             # 人类文档
 └── scripts/
     ├── bt                # CLI 主程序（Python）
     ├── bt_setup.py       # 初始化脚本
-    └── bitable_config.json  # 配置文件（setup 后生成）
+    └── base_config.json  # 配置文件（setup 后生成）
 ```
 
 ## 灵感来源

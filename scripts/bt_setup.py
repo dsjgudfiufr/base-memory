@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bt setup — 一键创建 Bitable 表结构并生成配置文件
+bt setup — 一键创建 Base 表结构并生成配置文件
 
 用法:
   python3 bt_setup.py [--app-token EXISTING_TOKEN]
@@ -128,7 +128,7 @@ def create_table(token, app_token, table_name, fields):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="bt setup — 初始化 Bitable 表结构")
+    parser = argparse.ArgumentParser(description="bt setup — 初始化 Base 表结构")
     parser.add_argument("--app-token", help="已有的多维表格 app_token（不传则创建新的）")
     args = parser.parse_args()
     
@@ -163,7 +163,7 @@ def main():
             config["tables"][key] = {"id": table_id, "name": name, "fields": field_map}
     
     # Write config
-    config_path = os.path.join(SCRIPT_DIR, "bitable_config.json")
+    config_path = os.path.join(SCRIPT_DIR, "base_config.json")
     with open(config_path, "w") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
     
