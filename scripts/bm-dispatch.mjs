@@ -364,6 +364,7 @@ async function fetchNextTask(cfg) {
       conjunction: 'or',
       conditions: [
         { field_name: '状态', operator: 'is', value: ['🔄 进行中'] },
+        { field_name: '状态', operator: 'is', value: ['⏸️ 已暂停'] },
         { field_name: '状态', operator: 'is', value: ['🕐 待开始'] },
       ],
     },
@@ -1735,6 +1736,18 @@ async function main() {
     while (result?.status === 'preempted') {
       log('⚡', '被抢占，继续执行高优任务...');
       result = await dispatchOnce({ dryRun });
+    }
+    // 高优任务完成后，自动恢复暂停的任务（drain 模式：持续执行直到无任务）
+    if (result && result.status !== 'skipped') {
+      let next = await dispatchOnce({ dryRun });
+      while (next && next.status !== 'skipped') {
+        log('🔄', `继续执行: ${next.status} — ${(next.summary || '').slice(0, 60)}`);
+        if (next.status === 'preempted') {
+          next = await dispatchOnce({ dryRun });
+          continue;
+        }
+        next = await dispatchOnce({ dryRun });
+      }
     }
     if (result) {
       log('🏁', `单轮完成: ${result.status}`);
