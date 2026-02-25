@@ -856,7 +856,50 @@ async function planTask(task, cfg) {
 只输出 JSON。`;
 
   const raw = await callLLM(planPrompt);
-  return extractResultJSON(raw);
+  
+  // 独立解析规划 JSON（不要求 status 字段）
+  const parsed = extractPlanJSON(raw);
+  return parsed;
+}
+
+/**
+ * 从 LLM 输出中提取规划 JSON（plan/subtasks/needsSubtasks）。
+ */
+function extractPlanJSON(raw) {
+  const fallback = { plan: '', subtasks: [], needsSubtasks: false };
+  if (!raw || typeof raw !== 'string') return fallback;
+
+  const tryParse = (str) => {
+    try {
+      const obj = JSON.parse(str);
+      if (obj && typeof obj === 'object' && ('plan' in obj || 'subtasks' in obj)) return obj;
+    } catch {}
+    return null;
+  };
+
+  // 直接解析
+  const direct = tryParse(raw.trim());
+  if (direct) return { ...fallback, ...direct };
+
+  // 从 code block 提取
+  const re = /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const p = tryParse(m[1].trim());
+    if (p) return { ...fallback, ...p };
+  }
+
+  // 贪心匹配 JSON 对象
+  let depth = 0, start = -1;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '{') { if (depth === 0) start = i; depth++; }
+    else if (raw[i] === '}') { depth--; if (depth === 0 && start >= 0) {
+      const p = tryParse(raw.slice(start, i + 1));
+      if (p) return { ...fallback, ...p };
+    }}
+  }
+
+  return fallback;
 }
 
 // ── 单轮调度 ─────────────────────────────────────────────────────
