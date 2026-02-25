@@ -702,31 +702,59 @@ export async function parseResult(raw, task, subtask, cfg) {
 // ── LLM 调用 ─────────────────────────────────────────────────────
 
 async function callLLM(prompt) {
-  // 方式1：OpenClaw hooks API
-  const hookUrl = `http://localhost:${OPENCLAW_PORT}/hooks/agent`;
+  // 从 openclaw.json 读取 LLM 配置，直接调 API（同步等待结果）
+  let baseUrl, apiKey, model;
   try {
-    log('🤖', `调用 LLM via ${hookUrl}`);
-    const res = await fetch(hookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: prompt }),
-      signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
-    });
+    const oc = loadOpenClawConfig();
+    // 优先用环境变量
+    baseUrl = process.env.LLM_BASE_URL;
+    apiKey = process.env.LLM_API_KEY;
+    model = process.env.LLM_MODEL;
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+    if (!baseUrl || !apiKey) {
+      // 从 openclaw.json 读取第一个自定义 provider
+      const providers = oc.models?.providers || {};
+      for (const [name, p] of Object.entries(providers)) {
+        if (p.baseUrl && p.apiKey) {
+          baseUrl = p.baseUrl;
+          apiKey = p.apiKey;
+          model = model || p.models?.[0]?.id || 'claude-sonnet-4-6';
+          break;
+        }
+      }
     }
+  } catch {}
 
-    const data = await res.json();
-    // hooks/agent 返回格式可能是 { response, sessionId } 或直接文本
-    const output = data.response || data.message || data.text || JSON.stringify(data);
-    log('📥', `LLM 返回 ${output.length} 字符`);
-    return output;
-  } catch (err) {
-    log('⚠️', `OpenClaw hooks 调用失败: ${err.message}`);
-    throw err;
+  if (!baseUrl || !apiKey) {
+    throw new Error('未找到 LLM 配置，请设置 LLM_BASE_URL + LLM_API_KEY 或配置 openclaw.json models.providers');
   }
+
+  model = model || 'claude-sonnet-4-6';
+  log('🤖', `调用 LLM: ${model} via ${baseUrl}`);
+
+  const res = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 4096,
+    }),
+    signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`LLM HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  const output = data.choices?.[0]?.message?.content || JSON.stringify(data);
+  log('📥', `LLM 返回 ${output.length} 字符`);
+  return output;
 }
 
 // ── 单轮调度 ─────────────────────────────────────────────────────
