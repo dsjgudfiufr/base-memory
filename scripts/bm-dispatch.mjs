@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * bt-dispatch.mjs — 代码驱动的任务调度器核心循环
+ * bm-dispatch.mjs — 代码驱动的任务调度器核心循环
  *
  * 独立 Node 进程：循环查 Base 任务表 → 拼 prompt → spawn LLM session
  * → 等结果 → 解析结果写表 → 下一个任务。
  *
  * 用法:
- *   node bt-dispatch.mjs                # 持续循环
- *   node bt-dispatch.mjs --once         # 执行一轮（测试用）
- *   import { dispatch, dispatchOnce } from './bt-dispatch.mjs'
+ *   node bm-dispatch.mjs                # 持续循环
+ *   node bm-dispatch.mjs --once         # 执行一轮（测试用）
+ *   import { dispatch, dispatchOnce } from './bm-dispatch.mjs'
  */
 
 import { readFileSync, existsSync } from 'fs';
@@ -802,7 +802,7 @@ export async function dispatch(opts = {}) {
   const intervalMs = opts.intervalMs || POLL_INTERVAL_MS;
   const signal = opts.signal || null;
 
-  log('🚀', `bt-dispatch 启动 | 间隔=${intervalMs}ms | 最大错误=${MAX_ERROR_RETRIES} | port=${OPENCLAW_PORT}`);
+  log('🚀', `bm-dispatch 启动 | 间隔=${intervalMs}ms | 最大错误=${MAX_ERROR_RETRIES} | port=${OPENCLAW_PORT}`);
 
   while (true) {
     if (signal?.aborted) {
@@ -830,7 +830,7 @@ export async function dispatch(opts = {}) {
     await sleep(intervalMs, signal);
   }
 
-  log('👋', 'bt-dispatch 已退出');
+  log('👋', 'bm-dispatch 已退出');
 }
 
 function sleep(ms, signal) {

@@ -9,15 +9,15 @@ description: Use Feishu Base (Bitable) as an AI agent's external brain — task 
 
 ## Setup
 
-First-time setup: run `bt setup` to create tables and generate config.
+First-time setup: run `bm setup` to create tables and generate config.
 
 ```bash
 # Set credentials (or pass via config)
-export FEISHU_APP_ID="your_app_id"
-export FEISHU_APP_SECRET="your_app_secret"
+export FEISHU_APP_ID="YOUR_APP_ID"
+export FEISHU_APP_SECRET="YOUR_APP_SECRET"
 
 # Initialize: creates 3 tables in a new or existing Base
-python3 scripts/bt setup [--app-token EXISTING_APP_TOKEN]
+python3 scripts/bm setup [--app-token YOUR_APP_TOKEN]
 # → Generates base_config.json with table IDs and field IDs
 # → Creates: 任务表 / 执行日志表 / 记忆库
 ```
@@ -30,108 +30,118 @@ python3 scripts/bt setup [--app-token EXISTING_APP_TOKEN]
 | **执行日志表** (logs) | Process notes — findings, decisions, errors | `findings.md` + `progress.md` |
 | **记忆库** (memory) | Long-term memory — cross-task lessons | Persistent knowledge base |
 
-## Core Commands
+## Core Commands (`bm`)
 
 ### Task Management
 
 ```bash
-bt task add "Task name" [-p 紧急|重要|普通] [-i "original instruction"]
-bt task done <ID> [-s "result summary"]
-bt task phase <ID> "阶段2-实现"
-bt task show <ID>              # Re-read goal + plan (attention refresh)
-bt task ls [--all]             # List active tasks
-bt task next                   # Scheduler: what should I do now?
-bt task resume                 # 5-question restart check
-bt task block <ID> -r "reason"
-bt task interrupt <ID> -m "breakpoint description"
-bt task search <keyword>
+bm task add "Task name" [-p 紧急|重要|普通] [-i "original instruction"]
+bm task done <ID> [-s "result summary"]
+bm task phase <ID> "阶段2-实现"
+bm task show <ID>              # Re-read goal + plan (attention refresh)
+bm task ls [--all]             # List active tasks
+bm task next                   # Scheduler: what should I do now?
+bm task resume                 # 5-question restart check
+bm task block <ID> -r "reason"
+bm task interrupt <ID> -m "breakpoint description"
+bm task search <keyword>
 ```
 
 ### Subtasks (inline, no separate rows)
 
 ```bash
-bt task add "Subtask A" --parent <PARENT_ID>
-bt subtask phase <PARENT_ID> "Subtask A" "Phase description"
-bt subtask done <PARENT_ID> "Subtask A" -s "summary"
+bm task add "Subtask A" --parent <PARENT_ID>
+bm subtask phase <PARENT_ID> "Subtask A" "Phase description"
+bm subtask done <PARENT_ID> "Subtask A" -s "summary"
 # Last subtask done → parent auto-completes
 ```
 
 ### Execution Logs (context offloading)
 
 ```bash
-bt log add <ID> plan "Goal: ... Phases: ... Key questions: ..."
-bt log add <ID> finding "Discovery: ..."
-bt log add <ID> decision "Decision: A not B, reason: ..."
-bt log add <ID> error "Error: ... Cause: ... Fix: ..."
-bt log add <ID> resource "URL or file path"
-bt log add <ID> milestone "Phase N complete: ..."
-bt log add <ID> progress "What was done" --phase "Phase N"
-bt log ls <ID> [--type finding] [--last 10]
-bt log search <keyword>
+bm log add <ID> plan "Goal: ... Phases: ... Key questions: ..."
+bm log add <ID> finding "Discovery: ..."
+bm log add <ID> decision "Decision: A not B, reason: ..."
+bm log add <ID> error "Error: ... Cause: ... Fix: ..."
+bm log add <ID> resource "URL or file path"
+bm log add <ID> milestone "Phase N complete: ..."
+bm log add <ID> progress "What was done" --phase "Phase N"
+bm log ls <ID> [--type finding] [--last 10]
+bm log search <keyword>
 ```
 
 ### Memory (long-term)
 
 ```bash
-bt mem add "Title" "Content" [-t type]
-bt mem ls [--type 教训]
-bt mem search <keyword>
+bm mem add "Title" "Content" [-t type]
+bm mem ls [--type 教训]
+bm mem search <keyword>
 ```
+
+## 代码驱动调度（bm-dispatch）
+
+除了 LLM 自己用 `bm` 命令管理任务，还支持**代码驱动调度**模式：
+
+> **核心思想：LLM 不碰表，代码管进度。**
+
+bm-dispatch 是一个独立 Node 进程，循环查 Base 任务表 → 拼 prompt → 调用 LLM → 解析结果 JSON → 更新 Base。LLM 只需专注执行任务并返回结构化结果。
+
+### 三个触发入口
+
+```bash
+node scripts/bm-dispatch.mjs           # 持续循环（生产模式）
+node scripts/bm-dispatch.mjs --once    # 单轮执行（测试用）
+node scripts/bm-dispatch-startup.mjs   # 网关启动时自动恢复
+```
+
+### 配置
+
+```bash
+BT_POLL_INTERVAL_MS=30000    # 主循环间隔
+BT_MAX_ERROR_RETRIES=5       # 最大错误重试
+BT_LLM_TIMEOUT_MS=600000     # LLM 超时
+BT_OWNER_OPEN_ID=xxx         # 飞书通知接收人（可选）
+```
+
+详见 [references/prompt-templates.md](references/prompt-templates.md) 了解 prompt 构建和结果 JSON 格式。
 
 ## Built-in Safeguards
 
-1. **Content truncation** — `bt log add` auto-truncates at 500 chars, warns to use `--file`
-2. **Attention refresh** — Every 10 logs, reminds to `bt task show` (prevents drift)
+1. **Content truncation** — `bm log add` auto-truncates at 500 chars, warns to use `--file`
+2. **Attention refresh** — Every 10 logs, reminds to `bm task show` (prevents drift)
 3. **Plan-first check** — Warns if logging before writing a plan
-4. **Error protocol** — Tracks error count; must change approach before retrying
-5. **Completion check** — `bt task done` warns if plan or milestone logs are missing
+4. **Error protocol** — Tracks error count; must change approach before retrying; 5 failures → auto-block
+5. **Completion check** — `bm task done` warns if plan or milestone logs are missing
 
 ## Workflow Rules
 
-### Task Reception
+For the complete task execution methodology, see [references/workflow-rules.md](references/workflow-rules.md):
 
-```
-Receive instruction → bt task add → bt task phase → bt log add plan → execute
-```
+- **Task reception**: classify message → task or conversation → only tasks go to Base
+- **Plan first**: always `bm log add plan` before executing
+- **Two-action rule**: every 2 search/browse ops → immediately `bm log add finding`
+- **Visual content**: see image/screenshot → immediately textualize to finding log
+- **Context offloading**: tool output → log table, not context window
+- **Error protocol**: must change approach before retrying; 5 failures → auto-block
+- **Attention refresh**: `bm task show` every 10 tool calls or before major decisions
+- **Sub-Agent execution**: complex tasks use main+sub-agent pattern for reliability
+- **Code-driven dispatch**: bm-dispatch for production-grade task scheduling
 
-### Two-Action Rule (mandatory)
+## Reference Documents
 
-Every 2 search/browse/read operations → immediately `bt log add finding`. Don't batch.
-
-### Visual Content Rule
-
-See image/screenshot/PDF → immediately `bt log add finding` to textualize. Multimodal content doesn't persist.
-
-### Context Offloading
-
-Tool output stays in context only as: `"Written to log table recXXX"`. The actual content lives in Base.
-
-### Error Protocol
-
-```
-Fail #1 → diagnose, change approach → bt log add error
-Fail #2 → completely different method → bt log add error
-Fail #3+ → same pattern
-Fail #5 → escalate to human
-```
-
-**Iron rule: never repeat the same failed action.**
-
-### Phase Transitions
-
-```bash
-bt task phase <ID> "Phase 2"
-bt log add <ID> milestone "Phase 1 complete: ..."
-bt task next    # Interrupt check: higher priority task?
-```
+| Document | Content |
+|----------|---------|
+| [references/workflow-rules.md](references/workflow-rules.md) | Complete task execution methodology |
+| [references/lessons-learned.md](references/lessons-learned.md) | Practical lessons from Base API, messaging, error handling |
+| [references/prompt-templates.md](references/prompt-templates.md) | bm-dispatch prompt templates and result JSON format |
 
 ## Configuration
 
-`base_config.json` (generated by `bt setup`):
+`base_config.json` (generated by `bm setup`):
 
 ```json
 {
-  "app_token": "...",
+  "app_token": "YOUR_APP_TOKEN",
   "tables": {
     "tasks": { "id": "tblXXX", "fields": { "任务名称": "fldXXX", ... } },
     "logs":  { "id": "tblXXX", "fields": { "内容": "fldXXX", ... } },
@@ -141,15 +151,3 @@ bt task next    # Interrupt check: higher priority task?
 ```
 
 Credentials: set `FEISHU_APP_ID` + `FEISHU_APP_SECRET` env vars, or pass via config.
-
-## Workflow Rules
-
-For the complete task execution methodology (Manus context engineering adapted for Base), see [references/workflow-rules.md](references/workflow-rules.md). Key rules:
-
-- **Task reception**: classify message → task or conversation → only tasks go to Base
-- **Plan first**: always `bt log add plan` before executing
-- **Two-action rule**: every 2 search/browse ops → immediately `bt log add finding`
-- **Context offloading**: tool output → log table, not context window
-- **Error protocol**: must change approach before retrying; 5 failures → auto-block
-- **Attention refresh**: `bt task show` every 10 tool calls or before major decisions
-
