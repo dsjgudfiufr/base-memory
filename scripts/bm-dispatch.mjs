@@ -425,22 +425,8 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
 
   parts.push(`## 任务目标\n${name}`);
 
-  if (instruction) {
-    parts.push(`## 原始指令\n${instruction}`);
-  }
-
-  if (plan) {
-    parts.push(`## 整体规划\n${plan}`);
-  }
-
-  if (progressLines) {
-    parts.push(`## 当前进度\n${progressLines}`);
-  } else if (phase) {
-    parts.push(`## 当前进度\n${phase}`);
-  }
-
   if (subtaskName) {
-    // 尝试从 plan 中提取子任务描述
+    // 子任务模式：只传当前子任务信息，不传完整原始指令（防止 LLM 越界做其他步骤）
     let subtaskDesc = '';
     if (plan) {
       const planLines = plan.replace(/\\n/g, '\n').split('\n');
@@ -455,7 +441,27 @@ export async function buildPrompt(taskRecord, subtaskName, cfg) {
         }
       }
     }
+
+    if (progressLines) {
+      parts.push(`## 当前进度\n${progressLines}`);
+    }
+
     parts.push(`## 当前子任务\n名称：${subtaskName}${subtaskDesc ? `\n要求：${subtaskDesc}` : ''}\n\n⚠️ 重要：只执行当前子任务「${subtaskName}」，不要做其他子任务。完成后立即写结果文件。`);
+  } else {
+    // 单任务模式：传完整信息
+    if (instruction) {
+      parts.push(`## 原始指令\n${instruction}`);
+    }
+
+    if (plan) {
+      parts.push(`## 整体规划\n${plan}`);
+    }
+
+    if (progressLines) {
+      parts.push(`## 当前进度\n${progressLines}`);
+    } else if (phase) {
+      parts.push(`## 当前进度\n${phase}`);
+    }
   }
 
   if (logLines) {
