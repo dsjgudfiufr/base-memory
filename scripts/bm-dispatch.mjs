@@ -11,7 +11,7 @@
  *   import { dispatch, dispatchOnce } from './bm-dispatch.mjs'
  */
 
-import { readFileSync, existsSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -46,6 +46,99 @@ function ts() {
 }
 function log(emoji, ...args) {
   console.log(`[${ts()}] ${emoji}`, ...args);
+}
+
+// ── 并发锁 ───────────────────────────────────────────────────────
+
+const LOCK_FILE = '/tmp/bm-dispatch.lock';
+const LOCK_STALE_MS = parseInt(process.env.BT_LOCK_STALE_MS || '900000', 10); // 15 min
+
+/**
+ * 尝试获取排他锁。
+ * 锁文件格式：{ pid, startTime, taskId? }
+ * @returns {boolean} true 表示获得锁
+ */
+export function acquireLock(taskId) {
+  if (existsSync(LOCK_FILE)) {
+    try {
+      const lockData = JSON.parse(readFileSync(LOCK_FILE, 'utf-8'));
+      const age = Date.now() - (lockData.startTime || 0);
+
+      // 检查进程是否还活着
+      let alive = false;
+      if (lockData.pid) {
+        try { process.kill(lockData.pid, 0); alive = true; } catch { alive = false; }
+      }
+
+      if (alive && age < LOCK_STALE_MS) {
+        // 锁有效，另一个 dispatch 正在运行
+        log('🔒', `锁被持有 (pid=${lockData.pid}, age=${Math.round(age / 1000)}s, task=${lockData.taskId || '?'})，跳过本轮`);
+        return false;
+      }
+
+      // 锁过期或进程已死，清理
+      log('🔓', `清理过期锁 (pid=${lockData.pid}, age=${Math.round(age / 1000)}s, alive=${alive})`);
+      try { unlinkSync(LOCK_FILE); } catch {}
+    } catch {
+      // 锁文件损坏，删除
+      try { unlinkSync(LOCK_FILE); } catch {}
+    }
+  }
+
+  // 写入新锁
+  const lockData = { pid: process.pid, startTime: Date.now(), taskId: taskId || null };
+  writeFileSync(LOCK_FILE, JSON.stringify(lockData));
+  return true;
+}
+
+/**
+ * 释放锁。只释放自己持有的锁。
+ */
+export function releaseLock() {
+  if (!existsSync(LOCK_FILE)) return;
+  try {
+    const lockData = JSON.parse(readFileSync(LOCK_FILE, 'utf-8'));
+    if (lockData.pid === process.pid) {
+      unlinkSync(LOCK_FILE);
+      log('🔓', '锁已释放');
+    }
+  } catch {
+    // 锁文件损坏，直接删
+    try { unlinkSync(LOCK_FILE); } catch {}
+  }
+}
+
+/**
+ * 更新锁中的 taskId（执行过程中更新，方便调试）。
+ */
+function updateLockTask(taskId) {
+  if (!existsSync(LOCK_FILE)) return;
+  try {
+    const lockData = JSON.parse(readFileSync(LOCK_FILE, 'utf-8'));
+    if (lockData.pid === process.pid) {
+      lockData.taskId = taskId;
+      writeFileSync(LOCK_FILE, JSON.stringify(lockData));
+    }
+  } catch {}
+}
+
+/**
+ * 检查锁状态（供外部查询）。
+ * @returns {{ locked: boolean, pid?: number, age?: number, taskId?: string }}
+ */
+export function lockStatus() {
+  if (!existsSync(LOCK_FILE)) return { locked: false };
+  try {
+    const lockData = JSON.parse(readFileSync(LOCK_FILE, 'utf-8'));
+    const age = Date.now() - (lockData.startTime || 0);
+    let alive = false;
+    if (lockData.pid) {
+      try { process.kill(lockData.pid, 0); alive = true; } catch { alive = false; }
+    }
+    return { locked: alive && age < LOCK_STALE_MS, pid: lockData.pid, age, taskId: lockData.taskId, alive };
+  } catch {
+    return { locked: false };
+  }
 }
 
 // ── 配置读取 ──────────────────────────────────────────────────────
@@ -1153,6 +1246,19 @@ ${completedSummary}
  * 执行一轮调度：取最高优先级任务 → 规划 → 逐步执行 → 更新结果。
  */
 export async function dispatchOnce(opts = {}) {
+  // ── 并发锁检查 ─────────────────────────────────────────────────
+  if (!opts._skipLock && !acquireLock('checking')) {
+    return { status: 'skipped', summary: '另一个 dispatch 正在运行' };
+  }
+
+  try {
+    return await _dispatchOnceInner(opts);
+  } finally {
+    if (!opts._skipLock) releaseLock();
+  }
+}
+
+async function _dispatchOnceInner(opts) {
   const cfg = opts.config || loadConfig();
   const task = await fetchNextTask(cfg);
 
@@ -1168,6 +1274,8 @@ export async function dispatchOnce(opts = {}) {
   let planText = fv(fields, '任务进展');
   const errorCount = parseInt(fv(fields, '错误次数') || '0', 10);
 
+  // 更新锁中的任务信息
+  updateLockTask(`${taskName} (${recordId})`);
   log('🎯', `调度任务: ${priority} ${taskName}`);
   log('📋', `record_id: ${recordId}, 错误次数: ${errorCount}, 任务进展: "${planText ? planText.slice(0, 50) : '(空)'}"`);
 

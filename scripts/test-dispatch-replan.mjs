@@ -508,6 +508,108 @@ test('不同任务之间的 session 隔离（设计约束）', () => {
   assert(true, 'design constraint acknowledged');
 });
 
+// ══ 10. 并发锁 ══════════════════════════════════════════════════
+
+import { acquireLock, releaseLock, lockStatus } from './bm-dispatch.mjs';
+import { writeFileSync as fsWriteSync, unlinkSync as fsUnlink, existsSync as fsExists } from 'fs';
+
+const LOCK_FILE = '/tmp/bm-dispatch.lock';
+
+// 测试前清理锁文件
+function cleanLock() {
+  try { fsUnlink(LOCK_FILE); } catch {}
+}
+
+console.log('\n📋 10. 并发锁');
+
+test('无锁时 acquireLock 成功', () => {
+  cleanLock();
+  const got = acquireLock('test-task-1');
+  assert(got === true, 'should acquire');
+  assert(fsExists(LOCK_FILE), 'lock file should exist');
+  cleanLock();
+});
+
+test('已锁时 acquireLock 失败（同进程）', () => {
+  cleanLock();
+  // 模拟另一个进程的锁（用当前 PID，因为测试在同进程）
+  const got1 = acquireLock('task-A');
+  assert(got1 === true, 'first acquire');
+  
+  // 同进程第二次获取应该失败（锁还在）
+  const got2 = acquireLock('task-B');
+  assert(got2 === false, 'second acquire should fail');
+  cleanLock();
+});
+
+test('releaseLock 释放自己的锁', () => {
+  cleanLock();
+  acquireLock('task-release');
+  assert(fsExists(LOCK_FILE), 'lock should exist');
+  releaseLock();
+  assert(!fsExists(LOCK_FILE), 'lock should be removed');
+});
+
+test('releaseLock 不释放别人的锁', () => {
+  cleanLock();
+  // 写入一个假的锁（不同 PID）
+  fsWriteSync(LOCK_FILE, JSON.stringify({ pid: 99999, startTime: Date.now() }));
+  releaseLock(); // 当前进程不应该删除别人的锁
+  assert(fsExists(LOCK_FILE), 'should not delete other process lock');
+  cleanLock();
+});
+
+test('过期锁被清理', () => {
+  cleanLock();
+  // 写入一个过期锁（15分钟前）
+  fsWriteSync(LOCK_FILE, JSON.stringify({ pid: 99999, startTime: Date.now() - 920000 }));
+  const got = acquireLock('new-task');
+  assert(got === true, 'should acquire after stale lock cleanup');
+  cleanLock();
+});
+
+test('死进程的锁被清理', () => {
+  cleanLock();
+  // PID 99999 几乎不可能存在
+  fsWriteSync(LOCK_FILE, JSON.stringify({ pid: 99999, startTime: Date.now() }));
+  const got = acquireLock('new-task');
+  assert(got === true, 'should acquire after dead process lock');
+  cleanLock();
+});
+
+test('损坏的锁文件被清理', () => {
+  cleanLock();
+  fsWriteSync(LOCK_FILE, 'not valid json!!!');
+  const got = acquireLock('new-task');
+  assert(got === true, 'should acquire after corrupt lock');
+  cleanLock();
+});
+
+test('lockStatus 无锁时返回 locked:false', () => {
+  cleanLock();
+  const s = lockStatus();
+  assert(s.locked === false, 'should not be locked');
+});
+
+test('lockStatus 有锁时返回正确信息', () => {
+  cleanLock();
+  acquireLock('status-test');
+  const s = lockStatus();
+  assert(s.locked === true, 'should be locked');
+  assertEqual(s.pid, process.pid);
+  assertEqual(s.taskId, 'status-test');
+  assert(s.age < 5000, 'age should be recent');
+  cleanLock();
+});
+
+test('lockStatus 过期锁返回 locked:false', () => {
+  cleanLock();
+  fsWriteSync(LOCK_FILE, JSON.stringify({ pid: 99999, startTime: Date.now() - 920000 }));
+  const s = lockStatus();
+  assert(s.locked === false, 'stale lock should not count');
+  cleanLock();
+});
+
 // ══ 结果 ════════════════════════════════════════════════════════
 
 console.log(`\n${'═'.repeat(50)}`);
