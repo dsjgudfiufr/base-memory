@@ -699,17 +699,15 @@ export async function parseResult(raw, task, subtask, cfg) {
   return normalized;
 }
 
-// ── LLM 调用（通过 OpenClaw sessions_spawn）──────────────────────
+// ── LLM 调用（通过 OpenClaw hooks/agent + 文件通信）──────────────
 
 /**
- * 通过 OpenClaw /hooks/agent 触发隔离 session。
- * Sub-agent 有完整工具权限，会用 bt 命令直接更新 Base。
- * 
- * v2 改动：不再轮询结果文件/transcript，sub-agent 自己用 bt 命令更新 Base。
- * 调用方只需要确认 session 启动成功即可。
+ * 通过 OpenClaw /hooks/agent 触发隔离 session（有工具权限）。
+ * LLM 不调 bm 命令，只把结果 JSON 写入约定文件。
+ * dispatch 轮询文件获取结果，然后代码自动更新所有表状态。
  *
- * @param {string} prompt - 构建好的 prompt（含 bt 命令指令）
- * @returns {Promise<{runId: string, sessionName: string}>} session 信息
+ * @param {string} prompt - 构建好的 prompt
+ * @returns {Promise<string>} LLM 写入的结果 JSON 字符串
  */
 async function callLLM(prompt) {
   const oc = loadOpenClawConfig();
@@ -721,9 +719,40 @@ async function callLLM(prompt) {
   }
 
   const dispatchId = Date.now();
+  const resultFile = `/tmp/bm-dispatch-result-${dispatchId}.json`;
   const sessionName = `dispatch-${dispatchId}`;
 
-  log('🤖', `触发 sessions_spawn (hooks/agent), id: ${dispatchId}`);
+  // prompt 末尾追加结果文件指令
+  const augmentedPrompt = `${prompt}
+
+## ⚠️ 必须执行：写结果文件
+完成任务后，把结果 JSON 写入指定文件。这是调度器获取结果的唯一方式。
+不要调用 bm 命令更新多维表格，调度器会自动处理。
+
+成功：
+\`\`\`bash
+cat > ${resultFile} << 'RESULT_EOF'
+{"status":"done","summary":"一句话描述你做了什么","files":["产出文件路径"]}
+RESULT_EOF
+\`\`\`
+
+失败：
+\`\`\`bash
+cat > ${resultFile} << 'RESULT_EOF'
+{"status":"error","message":"错误描述"}
+RESULT_EOF
+\`\`\`
+
+阻塞（需要人工介入）：
+\`\`\`bash
+cat > ${resultFile} << 'RESULT_EOF'
+{"status":"blocked","reason":"阻塞原因"}
+RESULT_EOF
+\`\`\`
+
+⚠️ 写结果文件是你的最后一步操作。`;
+
+  log('🤖', `触发 hooks/agent, 结果文件: ${resultFile}`);
 
   const res = await fetch(`http://localhost:${port}/hooks/agent`, {
     method: 'POST',
@@ -732,9 +761,9 @@ async function callLLM(prompt) {
       'Authorization': `Bearer ${hooksToken}`,
     },
     body: JSON.stringify({
-      message: prompt,
+      message: augmentedPrompt,
       name: sessionName,
-      deliver: false,
+      deliver: true,
       timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
     }),
   });
@@ -744,12 +773,35 @@ async function callLLM(prompt) {
     throw new Error(`hooks/agent HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
 
-  const hookResult = await res.json();
-  const runId = hookResult.runId;
-  log('📋', `session 已启动: runId=${runId}, name=${sessionName}`);
-  log('📝', `sub-agent 将用 bt 命令直接更新 Base，无需轮询结果`);
+  const { runId } = await res.json();
+  log('📋', `runId: ${runId}, 轮询结果文件...`);
 
-  return { runId, sessionName };
+  // 轮询结果文件
+  const startTime = Date.now();
+  const pollInterval = 5000;
+  const maxWait = LLM_TIMEOUT_MS;
+
+  while (Date.now() - startTime < maxWait) {
+    await new Promise(r => setTimeout(r, pollInterval));
+
+    try {
+      if (existsSync(resultFile)) {
+        const content = readFileSync(resultFile, 'utf-8').trim();
+        if (content) {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          log('📥', `结果文件就绪 (${elapsed}s), ${content.length} 字符`);
+          try { unlinkSync(resultFile); } catch {}
+          return content;
+        }
+      }
+    } catch {}
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    if (elapsed % 30 === 0 && elapsed > 0) log('⏳', `等待 LLM 完成... ${elapsed}s`);
+  }
+
+  try { unlinkSync(resultFile); } catch {}
+  throw new Error(`LLM 超时 (${Math.floor(maxWait / 1000)}s), 结果文件未生成`);
 }
 
 // ── 单轮调度 ─────────────────────────────────────────────────────
@@ -795,19 +847,20 @@ export async function dispatchOnce(opts = {}) {
     return { taskId: recordId, status: 'dry-run', summary: 'skipped' };
   }
 
-  // 调用 LLM（fire-and-forget：sub-agent 用 bt 命令直接更新 Base）
-  let sessionInfo;
+  // 调用 LLM（等待结果文件）
+  let rawOutput;
   try {
-    sessionInfo = await callLLM(prompt);
+    rawOutput = await callLLM(prompt);
   } catch (err) {
     const blocked = await incrementErrorCount(cfg, recordId, `LLM 调用失败: ${err.message}`);
     return { taskId: recordId, status: blocked ? 'blocked' : 'error', summary: err.message };
   }
 
-  // v2: sub-agent 自己用 bt 命令更新 Base，dispatch 不再等待/解析结果
-  log('📊', `已派发: runId=${sessionInfo.runId}, sub-agent 将自行更新 Base`);
+  // 解析结果并由代码自动更新所有表状态
+  const result = await parseResult(rawOutput, task, subtaskName, cfg);
+  log('📊', `结果: status=${result.status}, summary=${(result.summary || result.message || '').slice(0, 80)}`);
 
-  return { taskId: recordId, status: 'dispatched', summary: `session: ${sessionInfo.sessionName}` };
+  return { taskId: recordId, status: result.status, summary: result.summary || result.message || '' };
 }
 
 // ── 主循环 ───────────────────────────────────────────────────────
