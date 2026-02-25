@@ -964,13 +964,22 @@ export async function dispatchOnce(opts = {}) {
   }
 
   // ── 第二步：执行 ───────────────────────────────────────────────
+  let result;
+  let llmCalls = planText ? 0 : 1; // 规划用了 1 次
   if (subtasks.length > 0) {
-    // 有子任务：逐步执行
-    return await executeWithSubtasks(task, subtasks, planText, cfg);
+    result = await executeWithSubtasks(task, subtasks, planText, cfg);
+    llmCalls += subtasks.length; // 每个子任务 1 次
   } else {
-    // 无子任务：直接执行
-    return await executeSingle(task, cfg);
+    result = await executeSingle(task, cfg);
+    llmCalls += 1;
   }
+
+  // 写入 LLM 调用次数到 Token 开销字段
+  try {
+    await updateField(cfg, recordId, 'Token 开销', llmCalls);
+  } catch {}
+
+  return result;
 }
 
 /**
