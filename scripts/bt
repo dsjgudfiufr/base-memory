@@ -213,6 +213,21 @@ def print_task_detail(rec):
             for line in lines[:12]:
                 print(f"    {c(color, line)}")
 
+# ── 调度触发 ──────────────────────────────────────────────────────
+def _trigger_dispatch():
+    """后台触发 bt-dispatch.mjs --once，不阻塞当前命令"""
+    import subprocess
+    dispatch_script = os.path.join(SCRIPT_DIR, 'bt-dispatch.mjs')
+    if os.path.exists(dispatch_script):
+        try:
+            subprocess.Popen(
+                ['node', dispatch_script, '--once'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+        except Exception:
+            pass  # 调度失败不影响 bt 命令本身
+
 # ── TASK 子命令 ───────────────────────────────────────────────────
 
 def _auto_recall(c_, keywords, context='task'):
@@ -355,6 +370,9 @@ def task_add(args):
         keywords = _extract_keywords(search_text)
         if keywords:
             _auto_recall(c_, keywords)
+        # ── 紧急任务：立即触发调度（自动中断低优先级任务）─────────
+        if priority.startswith('🔴'):
+            _trigger_dispatch()
     else:
         err(f'创建失败: {r.get("msg")}')
 
@@ -540,6 +558,8 @@ def task_done(args):
         _reset_log_count(args.id)
         # ── 自动扫下一个任务 ──────────────────────────────────────
         _show_next_tasks(c_)
+        # ── 自动调度下一个任务 ────────────────────────────────────
+        _trigger_dispatch()
     else:
         err(f'更新失败: {r.get("msg")}')
 
@@ -1001,6 +1021,8 @@ def subtask_done(args):
         print(f"   {c(C.GRAY, '父任务进度：')} {c(C.CYAN, new_plan[new_plan.find('子任务'):].split(chr(10))[0][:60])}")
         print(f"\n{c(C.GREEN, '🎉 所有子任务已完成 → 父任务已自动标记完成！')}")
         _show_next_tasks(c_)
+        # ── 自动调度下一个任务 ────────────────────────────────────
+        _trigger_dispatch()
     else:
         api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
             {'fields': update_fields})
@@ -1011,6 +1033,8 @@ def subtask_done(args):
         if next_sub:
             print(f"   {c(C.CYAN, '→ 下一步：')} {c(C.WHITE, next_sub)}")
         _interrupt_check(c_, parent_id)
+        # ── 自动调度下一个任务 ────────────────────────────────────
+        _trigger_dispatch()
 
 
 def subtask_phase(args):
