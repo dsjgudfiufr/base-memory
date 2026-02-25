@@ -1064,10 +1064,10 @@ RESULT_EOF
 
 ⚠️ 写结果文件是你的最后一步操作。`;
 
-  // 构建 hooks/agent 请求体
+  // 构建 hooks/agent 请求体（deliver: false — 中间过程不通知飞书）
   const body = {
     message: finalPrompt,
-    deliver: true,
+    deliver: false,
     timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
   };
 
