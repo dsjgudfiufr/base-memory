@@ -724,7 +724,7 @@ export async function parseResult(raw, task, subtask, cfg) {
  * @param {string} prompt - 构建好的 prompt
  * @returns {Promise<string>} LLM 写入的结果 JSON 字符串
  */
-async function callLLM(prompt) {
+async function callLLM(prompt, opts = {}) {
   const oc = loadOpenClawConfig();
   const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN || oc.hooks?.token || '';
   const port = OPENCLAW_PORT;
@@ -737,8 +737,17 @@ async function callLLM(prompt) {
   const resultFile = `/tmp/bm-dispatch-result-${dispatchId}.json`;
   const sessionName = `dispatch-${dispatchId}`;
 
-  // prompt 末尾追加结果文件指令
-  const augmentedPrompt = `${prompt}
+  // prompt 末尾追加结果文件指令（planTask 模式跳过）
+  const finalPrompt = opts.rawOutput ? `${prompt}
+
+## ⚠️ 必须执行：写结果文件
+把你的 JSON 输出写入文件，这是调度器获取结果的唯一方式。
+\`\`\`bash
+cat > ${resultFile} << 'RESULT_EOF'
+你的JSON输出
+RESULT_EOF
+\`\`\`
+⚠️ 写结果文件是你的最后一步操作。不要执行任何其他操作。` : `${prompt}
 
 ## ⚠️ 必须执行：写结果文件
 完成任务后，把结果 JSON 写入指定文件。这是调度器获取结果的唯一方式。
@@ -776,7 +785,7 @@ RESULT_EOF
       'Authorization': `Bearer ${hooksToken}`,
     },
     body: JSON.stringify({
-      message: augmentedPrompt,
+      message: finalPrompt,
       name: sessionName,
       deliver: true,
       timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
@@ -805,7 +814,7 @@ RESULT_EOF
         if (content) {
           const elapsed = Math.round((Date.now() - startTime) / 1000);
           log('📥', `结果文件就绪 (${elapsed}s), ${content.length} 字符`);
-          try { unlinkSync(resultFile); } catch {}
+          // DEBUG: keep result file
           return content;
         }
       }
@@ -815,7 +824,7 @@ RESULT_EOF
     if (elapsed % 30 === 0 && elapsed > 0) log('⏳', `等待 LLM 完成... ${elapsed}s`);
   }
 
-  try { unlinkSync(resultFile); } catch {}
+  // DEBUG: keep result file
   throw new Error(`LLM 超时 (${Math.floor(maxWait / 1000)}s), 结果文件未生成`);
 }
 
@@ -855,7 +864,7 @@ async function planTask(task, cfg) {
 
 只输出 JSON。`;
 
-  const raw = await callLLM(planPrompt);
+  const raw = await callLLM(planPrompt, { rawOutput: true });
   
   // 独立解析规划 JSON（不要求 status 字段）
   const parsed = extractPlanJSON(raw);
