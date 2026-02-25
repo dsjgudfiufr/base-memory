@@ -215,9 +215,9 @@ def print_task_detail(rec):
 
 # ── 调度触发 ──────────────────────────────────────────────────────
 def _trigger_dispatch():
-    """后台触发 bt-dispatch.mjs --once，不阻塞当前命令"""
+    """后台触发 bm-dispatch.mjs --once，不阻塞当前命令"""
     import subprocess
-    dispatch_script = os.path.join(SCRIPT_DIR, 'bt-dispatch.mjs')
+    dispatch_script = os.path.join(SCRIPT_DIR, 'bm-dispatch.mjs')
     if os.path.exists(dispatch_script):
         try:
             subprocess.Popen(
