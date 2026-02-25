@@ -307,6 +307,54 @@ function findFirstIncompleteSubtask(planText) {
 
 // ── 任务获取与排序 ────────────────────────────────────────────────
 
+/**
+ * 中断检查：子任务完成后，检查是否有更高优先级任务需要抢占。
+ * 如果有，暂停当前任务（保存断点到任务进展字段），返回 preempted 状态。
+ */
+async function checkPreemption(cfg, currentRecordId, allSubtasks, completedResults, planText) {
+  try {
+    const nextTask = await fetchNextTask(cfg);
+    if (!nextTask) return null; // 没有其他任务
+
+    // 如果最高优先级任务还是当前任务，继续执行
+    if (nextTask.record_id === currentRecordId) return null;
+
+    // 比较优先级
+    const currentRec = await getRecord(cfg.app_token, cfg.tables.tasks.id, currentRecordId);
+    const currentPriority = PRIORITY_RANK[fv(currentRec?.fields, '优先级')] ?? 9;
+    const nextPriority = PRIORITY_RANK[fv(nextTask.fields, '优先级')] ?? 9;
+
+    // 只有更高优先级才抢占（数字越小优先级越高）
+    if (nextPriority >= currentPriority) return null;
+
+    const nextName = fv(nextTask.fields, '任务名称');
+    const doneCount = completedResults.filter(r => !r.summary.includes('恢复跳过')).length;
+    log('⚡', `中断！更高优先级任务: ${fv(nextTask.fields, '优先级')} ${nextName}`);
+
+    // 保存断点：更新任务进展字段（已完成的子任务标 ✅，未完成的保留 ○）
+    const breakpointLine = allSubtasks.map(s => {
+      if (completedResults.some(r => r.name === s)) return `✅${s}`;
+      return `○${s}`;
+    }).join(' → ');
+    const breakpointText = `${planText.split('\n')[0]}\n⏸️ 已暂停 (${doneCount}/${allSubtasks.length}) — 被 ${nextName} 抢占\n${breakpointLine}`;
+
+    await updateField(cfg, currentRecordId, '任务进展', breakpointText);
+    await updateField(cfg, currentRecordId, '状态', '⏸️ 已暂停');
+
+    log('⏸️', `任务已暂停 (${doneCount}/${allSubtasks.length}), 断点已保存`);
+
+    return {
+      taskId: currentRecordId,
+      status: 'preempted',
+      summary: `被 ${nextName} 抢占，已完成 ${doneCount}/${allSubtasks.length} 子任务`,
+      preemptedBy: nextTask.record_id,
+    };
+  } catch (err) {
+    log('⚠️', `中断检查失败（不阻塞）: ${err.message}`);
+    return null; // 检查失败不影响当前执行
+  }
+}
+
 async function fetchNextTask(cfg) {
   const { app_token } = cfg;
   const tableId = cfg.tables.tasks.id;
@@ -1434,6 +1482,13 @@ async function _dispatchOnceInner(opts) {
   }
 
   // ── 第三步：上下文卸载 + session 清场 ─────────────────────────
+  if (result.status === 'preempted') {
+    // 被抢占时：清场 session（高优任务需要干净上下文），但不卸载发现
+    await resetDispatchSession(cfg);
+    log('⚡', `任务被抢占，dispatch 将继续执行高优任务`);
+    return result;
+  }
+
   // 任务完成/失败/阻塞后，把关键发现写入日志表，然后清理 session
   if (result.status === 'done' || result.status === 'blocked' || result.status === 'error') {
     // 只在任务完成时卸载发现（失败/阻塞时 session 里可能没有有价值的发现）
@@ -1564,6 +1619,12 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
     lastFailedSubtask = '';
     completedResults.push({ name: subtaskName, summary: result.summary || 'done', files: result.files || [], tokens: result.tokens || 0 });
     log('✅', `子任务完成: ${subtaskName} — ${(result.summary || '').slice(0, 60)}`);
+
+    // ── 中断检查：是否有更高优先级任务插入 ────────────────────────
+    if (i < allSubtasks.length - 1) { // 最后一个子任务不检查（马上完成了）
+      const preemptResult = await checkPreemption(cfg, recordId, allSubtasks, completedResults, planText);
+      if (preemptResult) return preemptResult;
+    }
   }
 
   // 全部子任务完成
@@ -1629,8 +1690,12 @@ export async function dispatch(opts = {}) {
       const result = await dispatchOnce(opts);
       if (result) {
         log('📌', `本轮结果: ${result.status} — ${(result.summary || '').slice(0, 60)}`);
-        // v2: dispatched 状态表示已派发，sub-agent 正在执行，等待间隔后再检查
-        // 不再立即检查下一个（避免重复派发同一任务）
+
+        // 被抢占时立即进入下一轮（不等待间隔），执行高优任务
+        if (result.status === 'preempted') {
+          log('⚡', '被抢占，立即调度高优任务...');
+          continue;
+        }
       }
     } catch (err) {
       log('💥', `调度异常: ${err.message}`);
@@ -1665,7 +1730,12 @@ async function main() {
   const dryRun = args.includes('--dry-run');
 
   if (once) {
-    const result = await dispatchOnce({ dryRun });
+    let result = await dispatchOnce({ dryRun });
+    // 被抢占时继续执行高优任务（--once 也要处理抢占链）
+    while (result?.status === 'preempted') {
+      log('⚡', '被抢占，继续执行高优任务...');
+      result = await dispatchOnce({ dryRun });
+    }
     if (result) {
       log('🏁', `单轮完成: ${result.status}`);
     }
