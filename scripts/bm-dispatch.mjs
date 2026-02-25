@@ -218,6 +218,15 @@ async function markDone(cfg, recordId, summary) {
   };
   if (summary) fields['结果摘要'] = summary.slice(0, 200);
   await updateRecord(app_token, tableId, recordId, fields);
+
+/**
+ * 更新任务表的单个字段。
+ */
+async function updateField(cfg, recordId, fieldName, value) {
+  const { app_token } = cfg;
+  const tableId = cfg.tables.tasks.id;
+  await updateRecord(app_token, tableId, recordId, { [fieldName]: value });
+}
   log('✅', `任务完成: ${recordId}`);
 }
 
@@ -804,14 +813,49 @@ RESULT_EOF
   throw new Error(`LLM 超时 (${Math.floor(maxWait / 1000)}s), 结果文件未生成`);
 }
 
+// ── 规划阶段 ─────────────────────────────────────────────────────
+
+/**
+ * 让 LLM 分析任务并输出规划 JSON。
+ * @returns {{ plan: string, subtasks: string[] }}
+ */
+async function planTask(task, cfg) {
+  const fields = task.fields || {};
+  const taskName = fv(fields, '任务名称');
+  const rawInstruction = fv(fields, '原始指令');
+
+  const planPrompt = `你是一个任务规划器。分析以下任务，输出规划 JSON。
+
+## 任务
+名称：${taskName}
+原始指令：${rawInstruction}
+
+## 输出格式
+只输出一个 JSON，不要其他文字：
+\`\`\`json
+{
+  "plan": "目标：一句话\\n阶段：1-xxx → 2-xxx → 3-xxx",
+  "subtasks": ["子任务A", "子任务B", "子任务C"],
+  "needsSubtasks": true
+}
+\`\`\`
+
+规则：
+- 如果任务简单（一步能完成），设 needsSubtasks=false，subtasks=[]
+- 如果任务复杂（需要多步），拆成子任务，设 needsSubtasks=true
+- plan 字段简洁，不超过 200 字
+- 子任务名称简短明确
+
+只输出 JSON。`;
+
+  const raw = await callLLM(planPrompt);
+  return extractResultJSON(raw);
+}
+
 // ── 单轮调度 ─────────────────────────────────────────────────────
 
 /**
- * 执行一轮调度：取最高优先级任务 → 执行 → 更新结果。
- * @param {object} [opts] - 选项
- * @param {object} [opts.config] - 覆盖 base_config
- * @param {boolean} [opts.dryRun] - 只打印不执行 LLM
- * @returns {{ taskId: string, status: string, summary: string } | null}
+ * 执行一轮调度：取最高优先级任务 → 规划 → 逐步执行 → 更新结果。
  */
 export async function dispatchOnce(opts = {}) {
   const cfg = opts.config || loadConfig();
@@ -826,28 +870,136 @@ export async function dispatchOnce(opts = {}) {
   const fields = task.fields || {};
   const taskName = fv(fields, '任务名称');
   const priority = fv(fields, '优先级');
-  const planText = fv(fields, '任务规划');
+  let planText = fv(fields, '任务规划');
   const errorCount = parseInt(fv(fields, '错误次数') || '0', 10);
 
-  // 检查是否有子任务
-  const subtaskName = findFirstIncompleteSubtask(planText);
-
-  log('🎯', `调度任务: ${priority} ${taskName}${subtaskName ? ` → [${subtaskName}]` : ''}`);
+  log('🎯', `调度任务: ${priority} ${taskName}`);
   log('📋', `record_id: ${recordId}, 错误次数: ${errorCount}`);
 
   // 更新状态为进行中
-  await markInProgress(cfg, recordId, subtaskName);
-
-  // 构建 prompt
-  const prompt = await buildPrompt(task, subtaskName, cfg);
+  await markInProgress(cfg, recordId);
 
   if (opts.dryRun) {
+    const prompt = await buildPrompt(task, null, cfg);
     log('🏜️', 'DRY RUN — 跳过 LLM 调用');
     log('📝', `Prompt (${prompt.length} chars):\n${prompt.slice(0, 500)}...`);
     return { taskId: recordId, status: 'dry-run', summary: 'skipped' };
   }
 
-  // 调用 LLM（等待结果文件）
+  // ── 第一步：规划（如果还没有规划）──────────────────────────────
+  let subtasks = [];
+  if (!planText) {
+    log('📝', '开始规划...');
+    try {
+      await updateField(cfg, recordId, '当前阶段', '📝 规划中...');
+      const planResult = await planTask(task, cfg);
+      planText = planResult.plan || `目标：${taskName}`;
+      subtasks = planResult.subtasks || [];
+
+      if (subtasks.length > 0) {
+        planText += `\n子任务：${subtasks.join(' → ')}`;
+      }
+
+      // 代码写表：任务规划
+      await updateField(cfg, recordId, '任务规划', planText);
+      log('📋', `规划完成: ${subtasks.length} 个子任务`);
+    } catch (err) {
+      log('⚠️', `规划失败: ${err.message}，直接执行`);
+    }
+  } else {
+    // 从已有规划中解析子任务
+    subtasks = parseSubtasks(planText).filter(s => !s.startsWith('✅'));
+  }
+
+  // ── 第二步：执行 ───────────────────────────────────────────────
+  if (subtasks.length > 0) {
+    // 有子任务：逐步执行
+    return await executeWithSubtasks(task, subtasks, planText, cfg);
+  } else {
+    // 无子任务：直接执行
+    return await executeSingle(task, cfg);
+  }
+}
+
+/**
+ * 逐步执行子任务，每步代码自动更新进度。
+ */
+async function executeWithSubtasks(task, subtasks, planText, cfg) {
+  const recordId = task.record_id;
+  const allSubtasks = [...subtasks];
+  const completedResults = [];
+
+  for (let i = 0; i < allSubtasks.length; i++) {
+    const subtaskName = allSubtasks[i];
+    const progressLine = allSubtasks.map((s, j) => {
+      if (j < i) return `✅${s}`;
+      if (j === i) return `📍${s}`;
+      return `○${s}`;
+    }).join(' → ');
+
+    // 代码写表：当前阶段 + 任务规划进度
+    await updateField(cfg, recordId, '当前阶段', `📍 ${subtaskName} (${i + 1}/${allSubtasks.length})`);
+    const updatedPlan = planText.replace(/子任务：.*/, `子任务：${progressLine}`);
+    await updateField(cfg, recordId, '任务规划', updatedPlan);
+    log('📍', `子任务 ${i + 1}/${allSubtasks.length}: ${subtaskName}`);
+
+    // 构建子任务 prompt（含前序结果）
+    const prompt = await buildPrompt(task, subtaskName, cfg);
+    const contextPrompt = completedResults.length > 0
+      ? `\n\n## 前序子任务结果\n${completedResults.map(r => `✅ ${r.name}: ${r.summary}`).join('\n')}\n\n${prompt}`
+      : prompt;
+
+    // 执行
+    let rawOutput;
+    try {
+      rawOutput = await callLLM(contextPrompt);
+    } catch (err) {
+      const blocked = await incrementErrorCount(cfg, recordId, `子任务 ${subtaskName} 失败: ${err.message}`);
+      return { taskId: recordId, status: blocked ? 'blocked' : 'error', summary: err.message };
+    }
+
+    // 解析结果
+    const result = extractResultJSON(rawOutput);
+
+    if (result.status === 'error') {
+      const blocked = await incrementErrorCount(cfg, recordId, `子任务 ${subtaskName}: ${result.message || result.summary}`);
+      if (blocked) return { taskId: recordId, status: 'blocked', summary: result.message };
+      // 非 block 的错误，跳过这个子任务继续
+    }
+
+    if (result.status === 'blocked') {
+      await updateField(cfg, recordId, '状态', '🔒阻塞');
+      await updateField(cfg, recordId, '当前阶段', `🔒 ${subtaskName} 阻塞: ${result.reason || ''}`);
+      return { taskId: recordId, status: 'blocked', summary: result.reason };
+    }
+
+    // 子任务完成
+    completedResults.push({ name: subtaskName, summary: result.summary || 'done', files: result.files || [] });
+    log('✅', `子任务完成: ${subtaskName} — ${(result.summary || '').slice(0, 60)}`);
+  }
+
+  // 全部子任务完成
+  const finalProgress = allSubtasks.map(s => `✅${s}`).join(' → ');
+  const finalPlan = planText.replace(/子任务：.*/, `子任务：${finalProgress}`);
+  const finalSummary = completedResults.map(r => r.summary).join('; ').slice(0, 200);
+
+  await updateField(cfg, recordId, '任务规划', finalPlan);
+  await markDone(cfg, recordId, finalSummary);
+  log('🎉', `任务完成: ${allSubtasks.length} 个子任务全部完成`);
+
+  return { taskId: recordId, status: 'done', summary: finalSummary };
+}
+
+/**
+ * 直接执行单个任务（无子任务）。
+ */
+async function executeSingle(task, cfg) {
+  const recordId = task.record_id;
+
+  await updateField(cfg, recordId, '当前阶段', '🔄 执行中...');
+
+  const prompt = await buildPrompt(task, null, cfg);
+
   let rawOutput;
   try {
     rawOutput = await callLLM(prompt);
@@ -856,8 +1008,7 @@ export async function dispatchOnce(opts = {}) {
     return { taskId: recordId, status: blocked ? 'blocked' : 'error', summary: err.message };
   }
 
-  // 解析结果并由代码自动更新所有表状态
-  const result = await parseResult(rawOutput, task, subtaskName, cfg);
+  const result = await parseResult(rawOutput, task, null, cfg);
   log('📊', `结果: status=${result.status}, summary=${(result.summary || result.message || '').slice(0, 80)}`);
 
   return { taskId: recordId, status: result.status, summary: result.summary || result.message || '' };
