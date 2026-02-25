@@ -336,7 +336,7 @@ async function checkPreemption(cfg, currentRecordId, allSubtasks, completedResul
       if (completedResults.some(r => r.name === s)) return `✅${s}`;
       return `○${s}`;
     }).join(' → ');
-    const breakpointText = `${planText.split('\n')[0]}\n⏸️ 已暂停 (${doneCount}/${allSubtasks.length}) — 被 ${nextName} 抢占\n${breakpointLine}`;
+    const breakpointText = `${planText.split('\n')[0]}\n⏸️ 已暂停 (${doneCount}/${allSubtasks.length}) — 被 ${nextName} 抢占\n子任务：${breakpointLine}`;
 
     await updateField(cfg, currentRecordId, '任务进展', breakpointText);
     await updateField(cfg, currentRecordId, '状态', '⏸️ 已暂停');
