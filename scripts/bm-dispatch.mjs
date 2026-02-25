@@ -701,19 +701,17 @@ export async function parseResult(raw, task, subtask, cfg) {
 
 // ── LLM 调用（通过 OpenClaw sessions_spawn）──────────────────────
 
-async function callLLM(prompt) {
-  return callLLMViaSpawn(prompt);
-}
-
 /**
- * 通过 OpenClaw /hooks/agent 触发隔离 session（等同于 sessions_spawn）。
- * Agent 在隔离 session 里运行，有完整工具权限。
+ * 通过 OpenClaw /hooks/agent 触发隔离 session。
+ * Sub-agent 有完整工具权限，会用 bt 命令直接更新 Base。
+ * 
+ * v2 改动：不再轮询结果文件/transcript，sub-agent 自己用 bt 命令更新 Base。
+ * 调用方只需要确认 session 启动成功即可。
  *
- * 结果获取策略（双通道，提高可靠性）：
- * 1. 主通道：约定结果文件（agent 写入 /tmp/bm-dispatch-result-<ts>.json）
- * 2. 备用通道：轮询 session transcript，从最后一条 assistant 消息提取结果
+ * @param {string} prompt - 构建好的 prompt（含 bt 命令指令）
+ * @returns {Promise<{runId: string, sessionName: string}>} session 信息
  */
-async function callLLMViaSpawn(prompt) {
+async function callLLM(prompt) {
   const oc = loadOpenClawConfig();
   const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN || oc.hooks?.token || '';
   const port = OPENCLAW_PORT;
@@ -722,28 +720,8 @@ async function callLLMViaSpawn(prompt) {
     throw new Error('未找到 hooks token，请设置 OPENCLAW_HOOKS_TOKEN 或配置 openclaw.json hooks.token');
   }
 
-  // 用时间戳生成唯一标识
   const dispatchId = Date.now();
-  const resultFile = `/tmp/bm-dispatch-result-${dispatchId}.json`;
   const sessionName = `dispatch-${dispatchId}`;
-
-  // 在 prompt 末尾追加结果文件指令
-  const augmentedPrompt = `${prompt}
-
-## ⚠️ 重要：结果输出方式
-除了在对话中输出结果 JSON，你还必须把结果 JSON 写入文件：
-\`\`\`bash
-echo '{"status":"done","summary":"你的摘要","files":[]}' > ${resultFile}
-\`\`\`
-如果失败：
-\`\`\`bash
-echo '{"status":"error","message":"错误描述"}' > ${resultFile}
-\`\`\`
-如果阻塞：
-\`\`\`bash
-echo '{"status":"blocked","reason":"阻塞原因"}' > ${resultFile}
-\`\`\`
-这是必须的，调度器依赖这个文件获取你的执行结果。`;
 
   log('🤖', `触发 sessions_spawn (hooks/agent), id: ${dispatchId}`);
 
@@ -754,109 +732,24 @@ echo '{"status":"blocked","reason":"阻塞原因"}' > ${resultFile}
       'Authorization': `Bearer ${hooksToken}`,
     },
     body: JSON.stringify({
-      message: augmentedPrompt,
+      message: prompt,
       name: sessionName,
-      deliver: true,
+      deliver: false,
       timeoutSeconds: Math.floor(LLM_TIMEOUT_MS / 1000),
     }),
   });
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`sessions_spawn HTTP ${res.status}: ${text.slice(0, 200)}`);
+    throw new Error(`hooks/agent HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
 
   const hookResult = await res.json();
   const runId = hookResult.runId;
-  log('📋', `runId: ${runId}, 轮询结果...`);
+  log('📋', `session 已启动: runId=${runId}, name=${sessionName}`);
+  log('📝', `sub-agent 将用 bt 命令直接更新 Base，无需轮询结果`);
 
-  // 双通道轮询
-  const startTime = Date.now();
-  const pollInterval = 3000;
-  const maxWait = LLM_TIMEOUT_MS;
-
-  while (Date.now() - startTime < maxWait) {
-    await new Promise(r => setTimeout(r, pollInterval));
-
-    // 通道1：检查结果文件
-    try {
-      if (existsSync(resultFile)) {
-        const content = readFileSync(resultFile, 'utf-8').trim();
-        if (content) {
-          log('📥', `结果文件就绪 (${Math.round((Date.now() - startTime) / 1000)}s)`);
-          try { unlinkSync(resultFile); } catch {}
-          return content;
-        }
-      }
-    } catch {}
-
-    // 通道2：轮询 session transcript（每 15s 一次，减少 IO）
-    const elapsed = Math.round((Date.now() - startTime) / 1000);
-    if (elapsed > 10 && elapsed % 15 === 0) {
-      log('⏳', `等待完成... ${elapsed}s`);
-      try {
-        const transcriptResult = await pollTranscriptForResult(sessionName);
-        if (transcriptResult) {
-          log('📥', `从 transcript 获取结果 (${elapsed}s)`);
-          try { unlinkSync(resultFile); } catch {}
-          return transcriptResult;
-        }
-      } catch (err) {
-        if (elapsed % 30 === 0) log('⚠️', `transcript 轮询: ${err.message}`);
-      }
-    }
-  }
-
-  // 超时
-  try { unlinkSync(resultFile); } catch {}
-  throw new Error(`sessions_spawn 超时 (${Math.floor(maxWait / 1000)}s)`);
-}
-
-/**
- * 从 session transcript 文件中提取最后一条 assistant 消息。
- * 通过 sessions.json 查找匹配的 session，读取 .jsonl transcript。
- */
-async function pollTranscriptForResult(sessionName) {
-  const sessionsFile = resolve(process.env.HOME, '.openclaw/agents/main/sessions/sessions.json');
-  if (!existsSync(sessionsFile)) return null;
-
-  const sessions = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
-
-  // 查找包含 dispatch 名称的 session
-  let targetSessionId = null;
-  for (const [key, entry] of Object.entries(sessions)) {
-    if (key.includes(sessionName) || (entry.summary && entry.summary.includes(sessionName))) {
-      targetSessionId = entry.sessionId;
-      break;
-    }
-  }
-
-  if (!targetSessionId) return null;
-
-  const transcriptPath = resolve(
-    process.env.HOME,
-    `.openclaw/agents/main/sessions/${targetSessionId}.jsonl`
-  );
-  if (!existsSync(transcriptPath)) return null;
-
-  const lines = readFileSync(transcriptPath, 'utf-8').trim().split('\n');
-
-  // 从后往前找最后一条 assistant 消息
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const msg = JSON.parse(lines[i]);
-      if (msg.role === 'assistant' && msg.content) {
-        const content = typeof msg.content === 'string'
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.map(b => b.text || '').join('')
-            : '';
-        if (content.trim()) return content.trim();
-      }
-    } catch {}
-  }
-
-  return null;
+  return { runId, sessionName };
 }
 
 // ── 单轮调度 ─────────────────────────────────────────────────────
@@ -902,20 +795,19 @@ export async function dispatchOnce(opts = {}) {
     return { taskId: recordId, status: 'dry-run', summary: 'skipped' };
   }
 
-  // 调用 LLM
-  let rawOutput;
+  // 调用 LLM（fire-and-forget：sub-agent 用 bt 命令直接更新 Base）
+  let sessionInfo;
   try {
-    rawOutput = await callLLM(prompt);
+    sessionInfo = await callLLM(prompt);
   } catch (err) {
     const blocked = await incrementErrorCount(cfg, recordId, `LLM 调用失败: ${err.message}`);
     return { taskId: recordId, status: blocked ? 'blocked' : 'error', summary: err.message };
   }
 
-  // 解析结果 + 写入 Base（parseResult 内部处理所有状态更新）
-  const result = await parseResult(rawOutput, task, subtaskName, cfg);
-  log('📊', `结果: status=${result.status}, summary=${(result.summary || '').slice(0, 80)}`);
+  // v2: sub-agent 自己用 bt 命令更新 Base，dispatch 不再等待/解析结果
+  log('📊', `已派发: runId=${sessionInfo.runId}, sub-agent 将自行更新 Base`);
 
-  return { taskId: recordId, status: result.status, summary: result.summary };
+  return { taskId: recordId, status: 'dispatched', summary: `session: ${sessionInfo.sessionName}` };
 }
 
 // ── 主循环 ───────────────────────────────────────────────────────
@@ -944,11 +836,8 @@ export async function dispatch(opts = {}) {
       const result = await dispatchOnce(opts);
       if (result) {
         log('📌', `本轮结果: ${result.status} — ${(result.summary || '').slice(0, 60)}`);
-        // 如果有任务被处理，立即检查下一个（不等待间隔）
-        if (result.status === 'done') {
-          log('⏩', '任务完成，立即检查下一个');
-          continue;
-        }
+        // v2: dispatched 状态表示已派发，sub-agent 正在执行，等待间隔后再检查
+        // 不再立即检查下一个（避免重复派发同一任务）
       }
     } catch (err) {
       log('💥', `调度异常: ${err.message}`);
