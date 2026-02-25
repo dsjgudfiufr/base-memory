@@ -141,6 +141,44 @@ export function lockStatus() {
   }
 }
 
+// ── Token 计算（代码 diff 方式）──────────────────────────────────
+
+const DISPATCH_SESSION_ID = '34304c8f-cacb-4fac-afcc-b6e2ca6c57c4';
+const SESSION_DIR = resolve(process.env.HOME, '.openclaw/agents/main/sessions');
+
+/**
+ * 从 session jsonl 文件读取最后一条 assistant 消息的 totalTokens。
+ * 这个值是 OpenClaw 维护的累计 token 数，用于 diff 计算。
+ */
+function getSessionTotalTokens() {
+  // 动态查找 dispatch session 文件（遍历最近修改的文件）
+  const sessionFile = resolve(SESSION_DIR, `${DISPATCH_SESSION_ID}.jsonl`);
+  if (!existsSync(sessionFile)) {
+    // 尝试从配置找 session 文件
+    log('⚠️', 'dispatch session 文件不存在，token 计算跳过');
+    return 0;
+  }
+
+  try {
+    const data = readFileSync(sessionFile, 'utf-8');
+    const lines = data.split('\n').filter(l => l.trim());
+
+    // 从末尾往前找最后一条有 usage.totalTokens 的 message
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type === 'message') {
+          const totalTokens = entry.message?.usage?.totalTokens;
+          if (totalTokens && totalTokens > 0) return totalTokens;
+        }
+      } catch {}
+    }
+  } catch (err) {
+    log('⚠️', `读取 session token 失败: ${err.message}`);
+  }
+  return 0;
+}
+
 // ── 配置读取 ──────────────────────────────────────────────────────
 
 function loadConfig() {
@@ -1003,26 +1041,24 @@ RESULT_EOF
 完成任务后，把结果 JSON 写入指定文件。这是调度器获取结果的唯一方式。
 不要调用 bm 命令更新多维表格，调度器会自动处理。
 
-**写结果文件前，先用 session_status 工具查看当前 token 用量，把 tokens_in 填入结果 JSON 的 tokens 字段。**
-
 成功：
 \`\`\`bash
 cat > ${resultFile} << 'RESULT_EOF'
-{"status":"done","summary":"一句话描述你做了什么","files":["产出文件路径"],"tokens":12345}
+{"status":"done","summary":"一句话描述你做了什么","files":["产出文件路径"]}
 RESULT_EOF
 \`\`\`
 
 失败：
 \`\`\`bash
 cat > ${resultFile} << 'RESULT_EOF'
-{"status":"error","message":"错误描述","tokens":12345}
+{"status":"error","message":"错误描述"}
 RESULT_EOF
 \`\`\`
 
 阻塞（需要人工介入）：
 \`\`\`bash
 cat > ${resultFile} << 'RESULT_EOF'
-{"status":"blocked","reason":"阻塞原因","tokens":12345}
+{"status":"blocked","reason":"阻塞原因"}
 RESULT_EOF
 \`\`\`
 
@@ -1277,6 +1313,9 @@ async function _dispatchOnceInner(opts) {
   // 更新锁中的任务信息
   updateLockTask(`${taskName} (${recordId})`);
   log('🎯', `调度任务: ${priority} ${taskName}`);
+
+  // Token T0：任务开始前记录 session 累计 token
+  const tokenT0 = getSessionTotalTokens();
   log('📋', `record_id: ${recordId}, 错误次数: ${errorCount}, 任务进展: "${planText ? planText.slice(0, 50) : '(空)'}"`);
 
   // 更新状态为进行中
@@ -1378,13 +1417,21 @@ async function _dispatchOnceInner(opts) {
     result = await executeSingle(task, cfg);
   }
 
-  // 写入 Token 开销
+  // 写入 Token 开销（代码 diff 方式：T1 - T0）
   try {
-    const totalTokens = result.totalTokens || result.tokens || 0;
-    if (totalTokens > 0) {
-      await updateField(cfg, recordId, 'Token 开销', totalTokens);
+    const tokenT1 = getSessionTotalTokens();
+    const tokenDiff = tokenT1 - tokenT0;
+    if (tokenDiff > 0) {
+      await updateField(cfg, recordId, 'Token 开销', tokenDiff);
+      log('🔢', `Token 开销: ${tokenDiff} (T0=${tokenT0}, T1=${tokenT1})`);
+    } else if (tokenT1 > 0) {
+      // T0 为 0（首次任务），直接用 T1
+      await updateField(cfg, recordId, 'Token 开销', tokenT1);
+      log('🔢', `Token 开销: ${tokenT1} (首次，无 T0)`);
     }
-  } catch {}
+  } catch (err) {
+    log('⚠️', `Token 计算失败: ${err.message}`);
+  }
 
   // ── 第三步：上下文卸载 + session 清场 ─────────────────────────
   // 任务完成/失败/阻塞后，把关键发现写入日志表，然后清理 session
@@ -1528,8 +1575,7 @@ async function executeWithSubtasks(task, subtasks, planText, cfg) {
   await markDone(cfg, recordId, finalSummary);
   log('🎉', `任务完成: ${allSubtasks.length} 个子任务全部完成`);
 
-  const lastTokens = completedResults.length > 0 ? completedResults[completedResults.length - 1].tokens : 0;
-  return { taskId: recordId, status: 'done', summary: finalSummary, totalTokens: lastTokens };
+  return { taskId: recordId, status: 'done', summary: finalSummary };
 }
 
 /**
