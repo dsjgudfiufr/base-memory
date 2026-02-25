@@ -137,6 +137,43 @@ function assertIncludes(arr, item, msg) {
   if (!arr.includes(item)) throw new Error(msg || `Expected array to include "${item}", got [${arr.join(', ')}]`);
 }
 
+// ── 复制 extractFindingsJSON ────────────────────────────────────
+
+function extractFindingsJSON(raw) {
+  const fallback = { findings: [], decisions: [], resources: [] };
+  if (!raw || typeof raw !== 'string') return fallback;
+
+  const tryParse = (str) => {
+    try {
+      const obj = JSON.parse(str);
+      if (obj && typeof obj === 'object' && ('findings' in obj || 'decisions' in obj || 'resources' in obj)) return obj;
+    } catch {}
+    return null;
+  };
+
+  const direct = tryParse(raw.trim());
+  if (direct) return { ...fallback, ...direct };
+
+  const re = /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const p = tryParse(m[1].trim());
+    if (p) return { ...fallback, ...p };
+  }
+
+  let depth = 0, start = -1;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '{') { if (depth === 0) start = i; depth++; }
+    else if (raw[i] === '}') { depth--; if (depth === 0 && start >= 0) {
+      const p = tryParse(raw.slice(start, i + 1));
+      if (p) return { ...fallback, ...p };
+      start = -1;
+    }}
+  }
+
+  return fallback;
+}
+
 // ══ 测试用例 ════════════════════════════════════════════════════
 
 console.log('\n📋 1. parseSubtasks');
@@ -406,7 +443,57 @@ test('解析标准 plan JSON', () => {
   assert(obj.needsSubtasks === true);
 });
 
-console.log('\n📋 8. Session 复用场景');
+console.log('\n📋 8. extractFindingsJSON — 上下文卸载');
+
+test('解析完整 findings JSON', () => {
+  const raw = '{"findings":["API 限流上限为 100/min","缓存命中率 85%"],"decisions":["用 Redis 替代 Memcached"],"resources":["/tmp/report.md"]}';
+  const r = extractFindingsJSON(raw);
+  assertEqual(r.findings.length, 2);
+  assertEqual(r.decisions.length, 1);
+  assertEqual(r.resources.length, 1);
+  assertEqual(r.findings[0], 'API 限流上限为 100/min');
+});
+
+test('从 code block 中提取 findings', () => {
+  const raw = '执行完毕，总结如下：\n```json\n{"findings":["发现1"],"decisions":[],"resources":[]}\n```';
+  const r = extractFindingsJSON(raw);
+  assertEqual(r.findings, ['发现1']);
+});
+
+test('空输入返回默认值', () => {
+  const r = extractFindingsJSON('');
+  assertEqual(r.findings, []);
+  assertEqual(r.decisions, []);
+  assertEqual(r.resources, []);
+});
+
+test('无效 JSON 返回默认值', () => {
+  const r = extractFindingsJSON('这不是 JSON');
+  assertEqual(r.findings, []);
+});
+
+test('部分字段缺失补默认', () => {
+  const raw = '{"findings":["只有发现"]}';
+  const r = extractFindingsJSON(raw);
+  assertEqual(r.findings, ['只有发现']);
+  assertEqual(r.decisions, []);
+  assertEqual(r.resources, []);
+});
+
+test('只有 decisions 也能解析', () => {
+  const raw = '{"decisions":["用方案A不用方案B"]}';
+  const r = extractFindingsJSON(raw);
+  assertEqual(r.decisions, ['用方案A不用方案B']);
+});
+
+test('混合文本中提取 JSON', () => {
+  const raw = '好的，以下是总结：\n\n{"findings":["端口已被占用"],"decisions":["改用8081"],"resources":["/etc/nginx/conf.d/app.conf"]}\n\n以上。';
+  const r = extractFindingsJSON(raw);
+  assertEqual(r.findings[0], '端口已被占用');
+  assertEqual(r.resources[0], '/etc/nginx/conf.d/app.conf');
+});
+
+console.log('\n📋 9. Session 复用场景');
 
 test('第二次调用能看到第一次上下文（已通过线上测试验证）', () => {
   // 这是一个标记测试：实际验证已通过 hooks/agent 线上测试

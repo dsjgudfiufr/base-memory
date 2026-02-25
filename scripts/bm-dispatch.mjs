@@ -243,6 +243,139 @@ async function markDone(cfg, recordId, summary) {
   log('✅', `任务完成: ${recordId}`);
 }
 
+// ── 上下文卸载：任务完成后把发现写入日志表，然后清理 session ──
+
+/**
+ * 从 LLM 输出中提取 findings JSON。
+ */
+function extractFindingsJSON(raw) {
+  const fallback = { findings: [], decisions: [], resources: [] };
+  if (!raw || typeof raw !== 'string') return fallback;
+
+  const tryParse = (str) => {
+    try {
+      const obj = JSON.parse(str);
+      if (obj && typeof obj === 'object' && ('findings' in obj || 'decisions' in obj || 'resources' in obj)) return obj;
+    } catch {}
+    return null;
+  };
+
+  // 直接解析
+  const direct = tryParse(raw.trim());
+  if (direct) return { ...fallback, ...direct };
+
+  // 从 code block 提取
+  const re = /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const p = tryParse(m[1].trim());
+    if (p) return { ...fallback, ...p };
+  }
+
+  // 贪心匹配 JSON 对象
+  let depth = 0, start = -1;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '{') { if (depth === 0) start = i; depth++; }
+    else if (raw[i] === '}') { depth--; if (depth === 0 && start >= 0) {
+      const p = tryParse(raw.slice(start, i + 1));
+      if (p) return { ...fallback, ...p };
+      start = -1;
+    }}
+  }
+
+  return fallback;
+}
+
+/**
+ * 任务完成后，让 session 里的 LLM 总结关键发现，代码写入日志表。
+ * 这样即使 session 被清理，发现仍持久化在 Bitable 中。
+ */
+async function unloadFindings(task, cfg) {
+  const recordId = task.record_id;
+  const logTableId = cfg.tables?.logs?.id;
+  if (!logTableId) return;
+
+  try {
+    const prompt = `任务已完成。请回顾刚才的执行过程，总结关键发现。用 JSON 格式输出：
+\`\`\`json
+{
+  "findings": ["重要发现1", "重要发现2"],
+  "decisions": ["做出的技术决策及理由"],
+  "resources": ["产出文件路径或有用URL"]
+}
+\`\`\`
+规则：
+- 每条内容简洁（≤100字）
+- 只记有长期价值的发现，不记琐碎步骤
+- 没有就留空数组
+- 只输出 JSON`;
+
+    const raw = await callLLM(prompt, { rawOutput: true });
+    const parsed = extractFindingsJSON(raw);
+
+    let count = 0;
+    for (const f of (parsed.findings || []).slice(0, 5)) {
+      if (f && f.length > 2) {
+        await writeLog(cfg, recordId, '🔍 发现', f.slice(0, 500));
+        count++;
+      }
+    }
+    for (const d of (parsed.decisions || []).slice(0, 3)) {
+      if (d && d.length > 2) {
+        await writeLog(cfg, recordId, '🧭 决策', d.slice(0, 500));
+        count++;
+      }
+    }
+    for (const r of (parsed.resources || []).slice(0, 5)) {
+      if (r && r.length > 2) {
+        await writeLog(cfg, recordId, '📦 资源', r.slice(0, 500));
+        count++;
+      }
+    }
+
+    log('📤', `上下文卸载: ${count} 条发现写入日志表`);
+  } catch (err) {
+    log('⚠️', `上下文卸载失败（不阻塞）: ${err.message}`);
+  }
+}
+
+/**
+ * 重置 dispatch session，为下一个任务提供干净的上下文。
+ * 通过发送一条清场消息，让 LLM 知道新任务即将开始。
+ */
+async function resetDispatchSession(cfg) {
+  try {
+    const oc = loadOpenClawConfig();
+    const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN || oc.hooks?.token || '';
+    const port = OPENCLAW_PORT;
+
+    if (!hooksToken) return;
+
+    // 发送一条系统级清场消息
+    const res = await fetch(`http://localhost:${port}/hooks/agent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${hooksToken}`,
+      },
+      body: JSON.stringify({
+        message: '【系统】上一个任务已结束。清除之前的任务上下文。从现在起，你将执行全新的任务。之前的对话内容不再相关。回复"已就绪"即可。',
+        deliver: false,
+        name: 'session-reset',
+        timeoutSeconds: 30,
+      }),
+    });
+
+    if (res.ok) {
+      // 等待 session 处理清场消息
+      await new Promise(r => setTimeout(r, 5000));
+      log('🧹', 'dispatch session 已清场');
+    }
+  } catch (err) {
+    log('⚠️', `session 清场失败（不阻塞）: ${err.message}`);
+  }
+}
+
 /**
  * 更新任务表的单个字段。
  */
@@ -1144,6 +1277,17 @@ export async function dispatchOnce(opts = {}) {
       await updateField(cfg, recordId, 'Token 开销', totalTokens);
     }
   } catch {}
+
+  // ── 第三步：上下文卸载 + session 清场 ─────────────────────────
+  // 任务完成/失败/阻塞后，把关键发现写入日志表，然后清理 session
+  if (result.status === 'done' || result.status === 'blocked' || result.status === 'error') {
+    // 只在任务完成时卸载发现（失败/阻塞时 session 里可能没有有价值的发现）
+    if (result.status === 'done') {
+      await unloadFindings(task, cfg);
+    }
+    // 无论成功失败，都清场 session（为下一个任务准备干净上下文）
+    await resetDispatchSession(cfg);
+  }
 
   return result;
 }
