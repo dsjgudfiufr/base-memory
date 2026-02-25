@@ -959,7 +959,7 @@ export async function dispatchOnce(opts = {}) {
         planText += `\n子任务：${subtasks.join(' → ')}`;
       }
 
-      // 代码写表：任务规划
+      // 代码写表：任务进展
       await updateField(cfg, recordId, '任务进展', planText);
       log('📋', `规划完成: ${subtasks.length} 个子任务`);
     } catch (err) {
