@@ -1724,6 +1724,88 @@ def dispatch_done(args):
         warn(f'任务已标记阻塞：{summary}')
 
 
+# ── INJECT AGENTS ─────────────────────────────────────────────────
+
+_AGENTS_INJECT_CONTENT = """\
+
+## 📋 任务执行规范（Base Memory）
+
+> base-memory 不是按需触发的 skill，而是你的**默认工作方式**。
+> 收到任何任务都应遵循此工作流；对话（回复/问答/短确认）直接回复即可。
+
+### 任务接收协议
+
+收到消息先判断：含动词+交付物（帮我做X / 写Y / 分析Z / 实现W）→ ✅ 任务（走 bm 流程）；
+回复/澄清/问答/短确认 → 💬 对话（直接回复，不建表）
+
+### 启动流程（必须按顺序，不可跳过）
+
+```bash
+bm task add "任务名" -i "原始指令" [-p 普通|重要|紧急]  # 1. 建任务入队
+bm task phase <id> "阶段1-需求探索"                      # 2. 设置当前阶段
+bm log add <id> plan "目标/阶段/关键问题/约束"           # 3. 写计划（强制）
+```
+
+优先级识别：紧急/急/高优 → `-p 紧急`；重要/尽快 → `-p 重要`；其他 → `-p 普通`
+
+### 上下文卸载规则（工具结果不留在上下文里）
+
+```bash
+bm log add <id> finding "搜索/查看/浏览器发现"           # 每2次操作后必写
+bm log add <id> decision "决策：用A不用B，理由：..."     # 重要技术选择时
+bm log add <id> error "错误：...\n原因：...\n方案：..."  # 遇到错误立刻记
+bm log add <id> resource "URL 或文件路径"                # 有用资源
+```
+
+🔴 看到图片/截图后**立刻** `bm log add finding` 文字化（多模态内容不持久！）
+
+### 阶段转换（每个阶段完成时必须执行）
+
+```bash
+bm task phase <id> "阶段N-名称"          # 更新当前阶段
+bm log add <id> milestone "阶段N完成：..." # 记录里程碑
+bm task next                              # ⚠️ 中断检查：有更高优先级任务插入？
+bm task show <id>                         # 每 >10 次工具调用后刷新注意力
+```
+
+### 错误协议（强制）
+
+每次失败 → `bm log add <id> error` → **必须改变方法**才能重试
+🚫 不允许用完全相同的方式原样重试；第 5 次失败自动阻塞 + 通知 owner
+
+### 完成协议
+
+```bash
+bm task done <id> -s "结果摘要（≤200字）"
+# 然后回复用户，附上结论
+```
+
+完整规范：`references/workflow-rules.md`（base-memory skill 目录下）
+"""
+
+
+def _inject_agents_md():
+    """将精简版任务执行规范追加到 AGENTS.md。"""
+    # 自动发现 workspace 路径
+    workspace = os.environ.get('OPENCLAW_WORKSPACE') or os.path.expanduser('~/.openclaw/workspace')
+    agents_path = os.path.join(workspace, 'AGENTS.md')
+
+    # 检查是否已集成
+    if os.path.exists(agents_path):
+        with open(agents_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        if 'bm task' in content or 'base-memory' in content:
+            print(f'{c(C.YELLOW, "⚠️  AGENTS.md 已集成 base-memory 规范，跳过注入。")}')
+            return
+
+    # 追加内容
+    with open(agents_path, 'a', encoding='utf-8') as f:
+        f.write(_AGENTS_INJECT_CONTENT)
+
+    print(f'{c(C.GREEN, "✅ 任务执行规范已写入：")} {agents_path}')
+    print(f'{c(C.GRAY, "   包含：任务接收协议 / 启动流程 / 上下文卸载 / 错误协议 / 完成协议")}')
+
+
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -1736,6 +1818,8 @@ def main():
     # ── setup ──
     setup_p = sub.add_parser('setup', help='初始化: 创建 Base 表结构并生成配置')
     setup_p.add_argument('--app-token', help='已有的多维表格 app_token（不传则创建新的）')
+    setup_p.add_argument('--inject-agents', action='store_true',
+                         help='将任务执行规范追加到 AGENTS.md（已集成则跳过）')
 
     # ── task ──
     task_p = sub.add_parser('task', help='任务管理')
@@ -1897,7 +1981,13 @@ def main():
         cmd = [sys.executable, setup_script]
         if args.app_token:
             cmd.extend(['--app-token', args.app_token])
-        sys.exit(subprocess.call(cmd))
+        exit_code = subprocess.call(cmd)
+        if exit_code == 0:
+            if args.inject_agents:
+                _inject_agents_md()
+            else:
+                print(f'\n{c(C.GRAY, "💡 提示：运行 `bm setup --inject-agents` 将任务规范写入 AGENTS.md")}')
+        sys.exit(exit_code)
 
     if args.cmd == 'task':
         if not args.action:   task_p.print_help(); return

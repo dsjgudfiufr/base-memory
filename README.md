@@ -35,6 +35,33 @@ bm task next
 
 > `bm setup` 会在飞书多维表格中自动创建任务表、执行日志表、记忆库三张表，并生成 `base_config.json` 配置文件。
 
+## 集成到你的 Agent
+
+> base-memory **不是按需触发的 skill**，而是 agent 的**默认工作行为**。
+> 安装后，agent 收到任何任务都应走 bm 工作流——不需要关键词触发，是你应该如何工作的方法论。
+
+### 自动注入（推荐）
+
+```bash
+bm setup --inject-agents
+```
+
+将精简版任务执行规范追加到 `AGENTS.md`（或 `$OPENCLAW_WORKSPACE/AGENTS.md`），让 agent 从第一条任务起就走 bm 流程。如果已集成会自动跳过。
+
+### 手动集成
+
+把 `references/workflow-rules.md` 的核心规则复制到你的 `AGENTS.md` 或系统提示词中。
+
+### 核心规则（5 条）
+
+1. **入队先于执行** — 收到任务先 `bm task add` 入队，不直接执行
+2. **计划先于行动** — 执行前先 `bm log add plan` 写计划（不可跳过）
+3. **立刻卸载上下文** — 工具调用结果立刻写入日志表（`bm log add finding/error/decision`），不留在上下文
+4. **阶段转换时检查** — 每个阶段完成后 `bm task phase` 更新 + `bm task next` 中断检查
+5. **完成后回复用户** — `bm task done` 后附上结论回复触发消息
+
+> 完整规范见 [references/workflow-rules.md](references/workflow-rules.md)
+
 ## 命令速查
 
 ```
