@@ -31,7 +31,7 @@ export FEISHU_APP_SECRET="your_app_secret"
 bm setup
 
 # 4. Start using it
-bm task add "My first task" -p 普通 -i "Test task management"
+bm task add "My first task" -p 普通 -i "Test task management"   # 普通=normal
 bm task next
 ```
 
@@ -78,42 +78,43 @@ bm setup                             # One-command table setup
 ### Task Management
 
 ```bash
-bm task add "任务名" [-p 紧急|重要|普通] [-i "原始指令"]
-bm task add "子任务" --parent <parentID>  # Inline subtask (no new row)
-bm task done <ID> [-s "结果摘要"]
-bm task phase <ID> "阶段2-实现"
+# Priorities: 紧急=urgent | 重要=important | 普通=normal
+bm task add "Task name" [-p 紧急|重要|普通] [-i "original instruction"]
+bm task add "Subtask" --parent <parentID>  # Inline subtask (no new row)
+bm task done <ID> [-s "result summary"]
+bm task phase <ID> "Phase 2 - Implementation"
 bm task show <ID>                    # Re-read goal (attention refresh)
 bm task next                         # Scheduler: what should I do now?
 bm task resume                       # 5-question restart check
 bm task ls [--all]
-bm task interrupt <ID> -m "断点"     # Manual interrupt (auto-interrupt handled by dispatch)
+bm task interrupt <ID> -m "checkpoint note"  # Manual interrupt (auto handled by dispatch)
 ```
 
 ### Subtasks (Inline on Parent Row)
 
 ```bash
-bm task add "子任务A" --parent <parentID>
-bm subtask phase <parentID> "子任务A" "phase description"
-bm subtask done <parentID> "子任务A" -s "completion summary"
+bm task add "Subtask A" --parent <parentID>
+bm subtask phase <parentID> "Subtask A" "phase description"
+bm subtask done <parentID> "Subtask A" -s "completion summary"
 # When the last subtask completes → parent auto-completes
 ```
 
 ### Execution Logs (Context Offloading)
 
 ```bash
-bm log add <ID> finding "发现：API 返回格式是..."
-bm log add <ID> decision "决策：用 A 不用 B，理由..."
-bm log add <ID> error "错误：... 原因：... 方案：..."
-bm log add <ID> milestone "阶段1完成：..."
-bm log add <ID> resource "URL 或文件路径"
+bm log add <ID> finding "Found: API response format is..."
+bm log add <ID> decision "Decision: use A over B because..."
+bm log add <ID> error "Error: ... Cause: ... Fix: ..."
+bm log add <ID> milestone "Phase 1 complete: ..."
+bm log add <ID> resource "URL or file path"
 bm log ls <ID> [--type finding]
 ```
 
 ### Memory Store (Long-Term Memory)
 
 ```bash
-bm mem add "飞书 API 限制" "image API 不支持 interactive 消息类型" -t 教训
-bm mem search "飞书"
+bm mem add "Feishu API limits" "image API doesn't support interactive msg type" -t 教训  # 教训=lesson
+bm mem search "Feishu"
 ```
 
 ## Architecture
