@@ -82,8 +82,11 @@ def cfg():
 
 # ── 字段值提取 ────────────────────────────────────────────────────
 def fv(fields, key, truncate=None):
-    """提取字段值为字符串"""
+    """提取字段值为字符串（兼容任务进展字段新旧命名）"""
     val = fields.get(key)
+    if val is None and key == '任务进展':
+        # 新 schema: 当前阶段 + 任务规划（优先展示当前阶段）
+        val = fields.get('当前阶段') or fields.get('任务规划')
     if val is None: return ''
     if isinstance(val, list):
         text = ''.join(i.get('text', '') if isinstance(i, dict) else str(i) for i in val)
@@ -101,11 +104,103 @@ def fv(fields, key, truncate=None):
         text = text[:truncate] + '…'
     return text
 
+_TASK_FIELDS_CACHE = None
+
+
+def _task_fields():
+    global _TASK_FIELDS_CACHE
+    if _TASK_FIELDS_CACHE is None:
+        try:
+            _TASK_FIELDS_CACHE = cfg().get('tables', {}).get('tasks', {}).get('fields', {})
+        except Exception:
+            _TASK_FIELDS_CACHE = {}
+    return _TASK_FIELDS_CACHE
+
+
+def _task_progress_aliases():
+    """根据当前任务表字段，返回「任务进展」可用别名（兼容新旧 schema）"""
+    task_fields = _task_fields()
+    aliases = [name for name in ('任务进展', '当前阶段', '任务规划') if name in task_fields]
+    return aliases or ['任务进展']
+
+
+def _phase_field_name():
+    task_fields = _task_fields()
+    return '当前阶段' if '当前阶段' in task_fields else '任务进展'
+
+
+def _plan_field_name():
+    task_fields = _task_fields()
+    return '任务规划' if '任务规划' in task_fields else '任务进展'
+
+
+def _expand_progress_field_names(field_names):
+    if not isinstance(field_names, list):
+        return field_names
+    expanded = []
+    for name in field_names:
+        if name == '任务进展':
+            for alias in _task_progress_aliases():
+                if alias not in expanded:
+                    expanded.append(alias)
+        elif name not in expanded:
+            expanded.append(name)
+    return expanded
+
+
+def _rewrite_progress_field_refs(obj, preferred=None):
+    """把请求里的字段名「任务进展」重写为当前 schema 可用字段名"""
+    aliases = _task_progress_aliases()
+    target = preferred or aliases[0]
+
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k == 'field_name' and v == '任务进展':
+                out[k] = target
+            elif k == 'field_names':
+                out[k] = _expand_progress_field_names(v)
+            else:
+                out[k] = _rewrite_progress_field_refs(v, preferred=target)
+        return out
+    if isinstance(obj, list):
+        return [_rewrite_progress_field_refs(x, preferred=target) for x in obj]
+    return obj
+
+
+def _task_progress_fields(phase=None, plan=None):
+    """统一构造任务进展相关写入字段（兼容新旧 schema）"""
+    fields = {}
+    phase_field = _phase_field_name()
+    plan_field = _plan_field_name()
+    if plan is not None:
+        fields[plan_field] = plan
+    if phase is not None:
+        fields[phase_field] = phase
+    if plan is not None and phase is not None and plan_field == phase_field:
+        # 旧 schema 只有一个字段时，以阶段为准，保持历史行为
+        fields[phase_field] = phase
+    return fields
+
+
 def search_records(table_id, filter_body=None):
     c = cfg()
     body = {'page_size': 100}
-    if filter_body: body.update(filter_body)
+    if filter_body:
+        body.update(_rewrite_progress_field_refs(filter_body))
     r = api('POST', f'/bitable/v1/apps/{c["app_token"]}/tables/{table_id}/records/search', body)
+
+    # 兼容旧脚本仍传「任务进展」字段名：失败时自动切换到其他别名重试
+    if r.get('code', 0) == 1254045 and ('FieldNameNotFound' in str(r.get('msg', ''))):
+        for alias in _task_progress_aliases()[1:]:
+            retry_body = {'page_size': body.get('page_size', 100)}
+            for k, v in body.items():
+                if k != 'page_size':
+                    retry_body[k] = _rewrite_progress_field_refs(v, preferred=alias)
+            r = api('POST', f'/bitable/v1/apps/{c["app_token"]}/tables/{table_id}/records/search', retry_body)
+            if r.get('code', 0) == 0:
+                break
+
     if r.get('code', 0) != 0:
         warn(f'search_records 失败: [{r.get("code")}] {r.get("msg")}')
         return []
@@ -116,8 +211,10 @@ def search_records(table_id, filter_body=None):
 # ── STATUS 样式映射 ────────────────────────────────────────────────
 STATUS_COLOR = {
     '🕐 待开始': C.GRAY,
+    '🆕 待开始': C.GRAY,
     '🔄 进行中': C.BLUE,
     '🚧 阻塞中': C.YELLOW,
+    '🔴 阻塞': C.YELLOW,
     '⏸️ 已暂停': C.CYAN,
     '✅ 已完成': C.GREEN,
     '❌ 已取消': C.RED,
@@ -135,6 +232,60 @@ def fmt_status(s):
 def fmt_priority(p):
     color = PRIORITY_COLOR.get(p, C.RESET)
     return c(color, p)
+
+
+def _norm_status_name(s):
+    """兼容新旧状态命名（旧: 🕐/🚧；新: 🆕/🔴）"""
+    return {
+        '🕐 待开始': '🆕 待开始',
+        '🚧 阻塞中': '🔴 阻塞',
+    }.get(s, s)
+
+
+_STATUS_OPTIONS_CACHE = None
+
+
+def _status_alias_candidates(status):
+    norm = _norm_status_name(status)
+    if norm == '🆕 待开始':
+        return ['🆕 待开始', '🕐 待开始']
+    if norm == '🔴 阻塞':
+        return ['🔴 阻塞', '🚧 阻塞中']
+    return [norm]
+
+
+def _status_options():
+    """读取任务表状态字段可用枚举，避免 InvalidFilter"""
+    global _STATUS_OPTIONS_CACHE
+    if _STATUS_OPTIONS_CACHE is not None:
+        return _STATUS_OPTIONS_CACHE
+    try:
+        c_ = cfg()
+        table_id = c_['tables']['tasks']['id']
+        r = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/fields?page_size=500')
+        for item in r.get('data', {}).get('items', []):
+            if item.get('field_name') == '状态':
+                options = item.get('property', {}).get('options', [])
+                _STATUS_OPTIONS_CACHE = {o.get('name') for o in options if o.get('name')}
+                return _STATUS_OPTIONS_CACHE
+    except Exception:
+        pass
+    _STATUS_OPTIONS_CACHE = set()
+    return _STATUS_OPTIONS_CACHE
+
+
+def _status_filter_conditions(statuses):
+    options = _status_options()
+    conds = []
+    for s in statuses:
+        picked = None
+        for candidate in _status_alias_candidates(s):
+            if not options or candidate in options:
+                picked = candidate
+                break
+        if picked:
+            conds.append({'field_name': '状态', 'operator': 'is', 'value': [picked]})
+    return conds
 
 # ── 打印任务（单行简洁版） ─────────────────────────────────────────
 def print_task_line(rec):
@@ -343,7 +494,7 @@ def task_add(args):
         if not phase or phase == '阶段1-需求探索':
             phase = f'📍{args.name}：待开始'
         api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.parent}',
-            {'fields': {'任务进展': new_plan, '任务进展': phase}})
+            {'fields': _task_progress_fields(phase=phase, plan=new_plan)})
         ok(f'子任务已添加到父任务行')
         print(f"   {c(C.WHITE, args.name)}")
         print(f"   {c(C.GRAY, '↳ 父任务:')} {c(C.CYAN, args.parent)}")
@@ -378,18 +529,15 @@ def task_add(args):
 def _show_next_tasks(c_):
     """完成任务后，自动展示待开始/进行中/暂停/阻塞中的任务"""
     table_id = c_['tables']['tasks']['id']
-    r = api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/search', {
-        'filter': {'conjunction': 'or', 'conditions': [
-            {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
-            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
-            {'field_name': '状态', 'operator': 'is', 'value': ['⏸️ 已暂停']},
-            {'field_name': '状态', 'operator': 'is', 'value': ['🚧 阻塞中']},
-        ]},
+    conditions = _status_filter_conditions(['🆕 待开始', '🔄 进行中', '⏸️ 已暂停', '🔴 阻塞'])
+    query = {
         'sort': [{'field_name': '执行序号', 'desc': False}],
         'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数'],
         'page_size': 5
-    })
-    items = r.get('data', {}).get('items', [])
+    }
+    if conditions:
+        query['filter'] = {'conjunction': 'or', 'conditions': conditions}
+    items = search_records(table_id, query)
     if not items:
         print(c(C.GREEN, '\n🎉 没有待处理任务，全部完成！'))
         return
@@ -409,15 +557,14 @@ def _show_next_tasks(c_):
 def _interrupt_check(c_, current_id=None):
     """中断检查：是否有更高优先级任务需要打断当前任务（每个阶段/子任务完成后调用）"""
     table_id = c_['tables']['tasks']['id']
-    candidates = search_records(table_id, {
-        'filter': {'conjunction': 'or', 'conditions': [
-            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
-            {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
-            {'field_name': '状态', 'operator': 'is', 'value': ['⏸️ 已暂停']},
-        ]},
+    conditions = _status_filter_conditions(['🔄 进行中', '🆕 待开始', '⏸️ 已暂停'])
+    query = {
         'field_names': ['任务名称', '状态', '优先级', '执行序号'],
         'page_size': 20
-    })
+    }
+    if conditions:
+        query['filter'] = {'conjunction': 'or', 'conditions': conditions}
+    candidates = search_records(table_id, query)
     if not candidates:
         return
 
@@ -487,7 +634,8 @@ def task_done(args):
     c_ = cfg()
     table_id = c_['tables']['tasks']['id']
     now_ms = int(time.time() * 1000)
-    done_fields = {'状态': '✅ 已完成', '完成时间': now_ms, '任务进展': '✅ 交付完成'}
+    done_fields = {'状态': '✅ 已完成', '完成时间': now_ms}
+    done_fields.update(_task_progress_fields(phase='✅ 交付完成', plan='✅ 交付完成'))
     # 读取当前记录
     rec = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}')
     rec_fields = rec.get('data', {}).get('record', {}).get('fields', {})
@@ -496,7 +644,7 @@ def task_done(args):
     if cur_status == '✅ 已完成':
         warn(f'任务已经是完成状态，无需重复操作')
         return
-    if cur_status == '🕐 待开始':
+    if _norm_status_name(cur_status) == '🆕 待开始':
         warn(f'任务从未开始执行（待开始状态）！')
         print(f'   先运行：{c(C.GRAY, f"bm task up {args.id} 状态 🔄进行中")}')
         print(f'   如确认要直接完成（跳过执行），请加 --force 参数')
@@ -607,7 +755,7 @@ def task_block_internal(c_, task_id, reason):
     """内部调用：直接用 id 阻塞任务"""
     table_id = c_['tables']['tasks']['id']
     r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{task_id}',
-        {'fields': {'状态': '🚧 阻塞中'}})
+        {'fields': {'状态': _norm_status_name('🚧 阻塞中')}})
     return r.get('code') == 0
 
 def task_block(args):
@@ -653,25 +801,27 @@ def task_ls(args):
     c_ = cfg()
     table_id = c_['tables']['tasks']['id']
     if args.all:
-        statuses = ['🕐 待开始', '🔄 进行中', '⏸️ 已暂停', '🚧 阻塞中', '✅ 已完成', '❌ 已取消']
+        statuses = ['🆕 待开始', '🔄 进行中', '⏸️ 已暂停', '🔴 阻塞', '✅ 已完成', '❌ 已取消']
     elif args.status:
         status_map = {
-            '待开始':'🕐 待开始','进行中':'🔄 进行中',
-            '阻塞':'🚧 阻塞中','阻塞中':'🚧 阻塞中',
+            '待开始':'🆕 待开始','进行中':'🔄 进行中',
+            '阻塞':'🔴 阻塞','阻塞中':'🔴 阻塞',
             '完成':'✅ 已完成','已完成':'✅ 已完成',
             '暂停':'⏸️ 已暂停','已暂停':'⏸️ 已暂停',
         }
-        statuses = [status_map.get(s.strip(), s.strip()) for s in args.status.split(',')]
+        statuses = [_norm_status_name(status_map.get(s.strip(), s.strip())) for s in args.status.split(',')]
     else:
-        statuses = ['🔄 进行中', '⏸️ 已暂停', '🚧 阻塞中']
+        statuses = ['🔄 进行中', '⏸️ 已暂停', '🔴 阻塞']
 
-    conditions = [{'field_name': '状态', 'operator': 'is', 'value': [s]} for s in statuses]
-    recs = search_records(table_id, {
-        'filter': {'conjunction': 'or' if len(conditions)>1 else 'and', 'conditions': conditions},
+    query = {
         'sort': [{'field_name': '优先级', 'desc': False},
                  {'field_name': '执行序号', 'desc': False}],
         'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '结果摘要', '错误次数']
-    })
+    }
+    conditions = _status_filter_conditions(statuses)
+    if conditions:
+        query['filter'] = {'conjunction': 'or' if len(conditions)>1 else 'and', 'conditions': conditions}
+    recs = search_records(table_id, query)
     label = '、'.join(statuses)
     print(f'\n{c(C.BOLD, "📋 任务列表")}  {c(C.GRAY, label)}  ({len(recs)} 个)\n')
     if not recs:
@@ -755,7 +905,7 @@ def task_phase(args):
     c_ = cfg()
     table_id = c_['tables']['tasks']['id']
     r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}',
-        {'fields': {'任务进展': args.phase}})
+        {'fields': _task_progress_fields(phase=args.phase)})
     if r.get('code') == 0:
         ok(f'阶段已更新: {args.phase}')
         _interrupt_check(c_, args.id)
@@ -785,7 +935,8 @@ def _priority_rank(p):
 
 def _status_rank(s):
     """状态数值（进行中最优先）"""
-    return {'🔄 进行中': 0, '⏸️ 已暂停': 1, '🕐 待开始': 2, '🚧 阻塞中': 9}.get(s, 9)
+    s = _norm_status_name(s)
+    return {'🔄 进行中': 0, '⏸️ 已暂停': 1, '🆕 待开始': 2, '🔴 阻塞': 9}.get(s, 9)
 
 def task_next(args):
     """调度器：扫描所有未完成任务，推荐当前应该执行的任务"""
@@ -793,11 +944,9 @@ def task_next(args):
     table_id = c_['tables']['tasks']['id']
     # 拉取所有活跃任务（待开始+进行中+已暂停）
     candidates = search_records(table_id, {
-        'filter': {'conjunction': 'or', 'conditions': [
-            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
-            {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
-            {'field_name': '状态', 'operator': 'is', 'value': ['⏸️ 已暂停']},
-        ]},
+        'filter': {'conjunction': 'or', 'conditions': _status_filter_conditions([
+            '🔄 进行中', '🆕 待开始', '⏸️ 已暂停'
+        ])},
         'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数'],
         'page_size': 50
     })
@@ -825,7 +974,7 @@ def task_next(args):
     print(f'\n{c(C.BOLD, "🎯 调度建议")}\n')
 
     # 判断是否需要切换
-    in_progress = [r for r in candidates if fv(r.get('fields',{}), '状态') == '🔄 进行中']
+    in_progress = [r for r in candidates if _norm_status_name(fv(r.get('fields',{}), '状态')) == '🔄 进行中']
     current = in_progress[0] if in_progress else None
 
     need_switch = False   # 是否需要切换（用于 --notify 判断）
@@ -846,7 +995,7 @@ def task_next(args):
             print(f'  当前: {fmt_priority(cur_pri)}  {c(C.GRAY, cur_name)}')
         print(f'  {c(C.GREEN, "→ 应做")}:  {fmt_priority(top_pri)}  {c(C.WHITE, top_name)}')
         print(f'  {c(C.GRAY, top_id)}')
-        if top_sta == '🕐 待开始':
+        if _norm_status_name(top_sta) == '🆕 待开始':
             print(f'\n  开始执行：{c(C.GRAY, f"bm task up {top_id} 状态 🔄进行中")}')
         elif top_sta == '⏸️ 已暂停':
             print(f'\n  恢复执行：{c(C.GRAY, f"bm task up {top_id} 状态 🔄进行中")}')
@@ -918,7 +1067,7 @@ def subtask_add_batch(args):
 
     phase = f'📍{names[0]}：待开始'
     api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
-        {'fields': {'任务进展': new_plan, '任务进展': phase}})
+        {'fields': _task_progress_fields(phase=phase, plan=new_plan)})
 
     ok(f'批量添加 {len(names)} 个子任务 → {c(C.GRAY, parent_id)}')
     print(f'   {c(C.CYAN, "子任务：")} {c(C.WHITE, " → ".join(names))}')
@@ -990,7 +1139,7 @@ def subtask_done(args):
         next_sub = next((s for s in subtasks if f'✅{s}' not in new_plan), None)
         phase = f'📍{next_sub}' if next_sub else '✅ 全部完成'
 
-    update_fields = {'任务进展': new_plan, '任务进展': phase}
+    update_fields = _task_progress_fields(phase=phase, plan=new_plan)
 
     # 写 milestone 日志
     api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records',
@@ -1061,7 +1210,7 @@ def subtask_phase(args):
     # 只更新任务进展
     phase = f'📍{subtask_name}：{step}'
     r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
-        {'fields': {'任务进展': phase}})
+        {'fields': _task_progress_fields(phase=phase)})
     if r.get('code') == 0:
         ok(f'任务进展已更新')
         print(f"   {c(C.CYAN, '📍')} {c(C.WHITE, f'{subtask_name}：{step}')}")
@@ -1216,7 +1365,7 @@ def log_add(args):
     if ltype == PLAN_TYPE:
         plan_content = content_text[:300]
         api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}',
-            {'fields': {'任务进展': plan_content}})
+            {'fields': _task_progress_fields(plan=plan_content)})
         print(f"   {c(C.BLUE, '📋 规划 →')} 任务表「任务进展」字段")
         # 缓存：标记该任务已有 plan
         state = _load_state()
@@ -1249,7 +1398,7 @@ def log_add(args):
 
         if args.phase:
             api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}',
-                {'fields': {'任务进展': args.phase}})
+                {'fields': _task_progress_fields(phase=args.phase)})
             print(f"   {c(C.CYAN, '📍 任务进展 →')} {c(C.WHITE, args.phase)}")
 
         if is_error and new_error_count is not None:
