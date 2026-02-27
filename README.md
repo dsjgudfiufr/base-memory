@@ -1,3 +1,5 @@
+> 🇬🇧 [English](README_EN.md)
+
 # base-memory
 
 飞书多维表格驱动的 AI Agent 任务管理系统。代码驱动调度，LLM 只负责执行。
