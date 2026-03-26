@@ -1,0 +1,2198 @@
+#!/usr/bin/env python3
+"""
+bm - Base Memory CLI (AI Agent 外脑)
+用法:
+  bm task add <名称> [-p 紧急|重要|普通] [-i "原始指令"]
+  bm task done <id> [-t token数] [-s "结果摘要"]
+  bm task up <id> <字段名> <新值>
+  bm task ls [--all | --status 进行中]
+  bm task resume
+  bm task search <关键词>
+  bm task block <id> -r "阻塞原因"
+  bm task show <id>
+  bm mem add <标题> <内容> [-t 知识|教训|偏好|上下文] [-i 核心|重要|普通]
+  bm mem ls
+  bm mem search <关键词>
+"""
+
+import json, urllib.request, sys, os, time, argparse
+from datetime import datetime
+
+# ── 配置 ──────────────────────────────────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))  # 跟随 symlink 找真实路径
+CONFIG_FILE = os.path.join(SCRIPT_DIR, 'base_config.json')
+OPENCLAW_CONFIG = os.environ.get('OPENCLAW_CONFIG', os.path.expanduser('~/.openclaw/openclaw.json'))
+MAX_ERROR_RETRIES = int(os.environ.get('BT_MAX_ERROR_RETRIES', '5'))
+OWNER_OPEN_ID = os.environ.get('BT_OWNER_OPEN_ID', '')  # Owner's Feishu open_id (for notifications)
+
+# ── ANSI 颜色 ──────────────────────────────────────────────────────
+class C:
+    RESET  = '\033[0m'
+    BOLD   = '\033[1m'
+    RED    = '\033[91m'
+    GREEN  = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE   = '\033[94m'
+    CYAN   = '\033[96m'
+    GRAY   = '\033[90m'
+    WHITE  = '\033[97m'
+
+def c(color, text): return f'{color}{text}{C.RESET}'
+def ok(msg):   print(c(C.GREEN,  f'✅ {msg}'))
+def err(msg):  print(c(C.RED,    f'❌ {msg}')); sys.exit(1)
+def info(msg): print(c(C.CYAN,   f'ℹ  {msg}'))
+def warn(msg): print(c(C.YELLOW, f'⚠  {msg}'))
+def hr():      print(c(C.GRAY, '─' * 60))
+
+# ── API ───────────────────────────────────────────────────────────
+_token_cache = {'val': None, 'exp': 0}
+
+def get_token():
+    if _token_cache['val'] and time.time() < _token_cache['exp']:
+        return _token_cache['val']
+    with open(OPENCLAW_CONFIG) as f:
+        cfg = json.load(f)
+    acc = cfg['channels']['feishu']['accounts']['main']
+    req = urllib.request.Request(
+        'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
+        data=json.dumps({'app_id': acc['appId'], 'app_secret': acc['appSecret']}).encode(),
+        headers={'Content-Type': 'application/json'}
+    )
+    r = json.loads(urllib.request.urlopen(req).read())
+    _token_cache['val'] = r['tenant_access_token']
+    _token_cache['exp'] = time.time() + r.get('expire', 7200) - 60
+    return _token_cache['val']
+
+def api(method, path, body=None):
+    token = get_token()
+    url = f'https://open.feishu.cn/open-apis{path}'
+    data = json.dumps(body, ensure_ascii=False).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method,
+        headers={'Content-Type': 'application/json; charset=utf-8',
+                 'Authorization': f'Bearer {token}'})
+    try:
+        return json.loads(urllib.request.urlopen(req).read())
+    except urllib.error.HTTPError as e:
+        try:    return json.loads(e.read())
+        except: return {'code': e.code, 'msg': str(e)}
+
+def cfg():
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
+
+# ── 字段值提取 ────────────────────────────────────────────────────
+def fv(fields, key, truncate=None):
+    """提取字段值为字符串（兼容任务进展字段新旧命名）"""
+    val = fields.get(key)
+    if val is None and key == '任务进展':
+        # 新 schema: 当前阶段 + 任务规划（优先展示当前阶段）
+        val = fields.get('当前阶段') or fields.get('任务规划')
+    if val is None: return ''
+    if isinstance(val, list):
+        text = ''.join(i.get('text', '') if isinstance(i, dict) else str(i) for i in val)
+    elif isinstance(val, bool):
+        text = '✅' if val else '☐'
+    elif isinstance(val, (int, float)):
+        if key in ('创建时间','开始执行时间','完成时间','记录时间'):
+            try: text = datetime.fromtimestamp(val/1000).strftime('%m-%d %H:%M')
+            except: text = str(val)
+        else:
+            text = str(int(val)) if float(val) == int(val) else str(val)
+    else:
+        text = str(val)
+    if truncate and len(text) > truncate:
+        text = text[:truncate] + '…'
+    return text
+
+_TASK_FIELDS_CACHE = None
+
+
+def _task_fields():
+    global _TASK_FIELDS_CACHE
+    if _TASK_FIELDS_CACHE is None:
+        try:
+            _TASK_FIELDS_CACHE = cfg().get('tables', {}).get('tasks', {}).get('fields', {})
+        except Exception:
+            _TASK_FIELDS_CACHE = {}
+    return _TASK_FIELDS_CACHE
+
+
+def _task_progress_aliases():
+    """根据当前任务表字段，返回「任务进展」可用别名（兼容新旧 schema）"""
+    task_fields = _task_fields()
+    aliases = [name for name in ('任务进展', '当前阶段', '任务规划') if name in task_fields]
+    return aliases or ['任务进展']
+
+
+def _phase_field_name():
+    task_fields = _task_fields()
+    return '当前阶段' if '当前阶段' in task_fields else '任务进展'
+
+
+def _plan_field_name():
+    task_fields = _task_fields()
+    return '任务规划' if '任务规划' in task_fields else '任务进展'
+
+
+def _expand_progress_field_names(field_names):
+    if not isinstance(field_names, list):
+        return field_names
+    expanded = []
+    for name in field_names:
+        if name == '任务进展':
+            for alias in _task_progress_aliases():
+                if alias not in expanded:
+                    expanded.append(alias)
+        elif name not in expanded:
+            expanded.append(name)
+    return expanded
+
+
+def _rewrite_progress_field_refs(obj, preferred=None):
+    """把请求里的字段名「任务进展」重写为当前 schema 可用字段名"""
+    aliases = _task_progress_aliases()
+    target = preferred or aliases[0]
+
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k == 'field_name' and v == '任务进展':
+                out[k] = target
+            elif k == 'field_names':
+                out[k] = _expand_progress_field_names(v)
+            else:
+                out[k] = _rewrite_progress_field_refs(v, preferred=target)
+        return out
+    if isinstance(obj, list):
+        return [_rewrite_progress_field_refs(x, preferred=target) for x in obj]
+    return obj
+
+
+def _task_progress_fields(phase=None, plan=None):
+    """统一构造任务进展相关写入字段（兼容新旧 schema）"""
+    fields = {}
+    phase_field = _phase_field_name()
+    plan_field = _plan_field_name()
+    if plan is not None:
+        fields[plan_field] = plan
+    if phase is not None:
+        fields[phase_field] = phase
+    if plan is not None and phase is not None and plan_field == phase_field:
+        # 旧 schema 只有一个字段时，以阶段为准，保持历史行为
+        fields[phase_field] = phase
+    return fields
+
+
+def search_records(table_id, filter_body=None):
+    c = cfg()
+    body = {'page_size': 100}
+    if filter_body:
+        body.update(_rewrite_progress_field_refs(filter_body))
+    r = api('POST', f'/bitable/v1/apps/{c["app_token"]}/tables/{table_id}/records/search', body)
+
+    # 兼容旧脚本仍传「任务进展」字段名：失败时自动切换到其他别名重试
+    if r.get('code', 0) == 1254045 and ('FieldNameNotFound' in str(r.get('msg', ''))):
+        for alias in _task_progress_aliases()[1:]:
+            retry_body = {'page_size': body.get('page_size', 100)}
+            for k, v in body.items():
+                if k != 'page_size':
+                    retry_body[k] = _rewrite_progress_field_refs(v, preferred=alias)
+            r = api('POST', f'/bitable/v1/apps/{c["app_token"]}/tables/{table_id}/records/search', retry_body)
+            if r.get('code', 0) == 0:
+                break
+
+    if r.get('code', 0) != 0:
+        warn(f'search_records 失败: [{r.get("code")}] {r.get("msg")}')
+        return []
+    return r.get('data', {}).get('items', [])
+
+# 执行序号和创建时间均由飞书自动填写，无需计算
+
+# ── STATUS 样式映射 ────────────────────────────────────────────────
+STATUS_COLOR = {
+    '🕐 待开始': C.GRAY,
+    '🆕 待开始': C.GRAY,
+    '🔄 进行中': C.BLUE,
+    '🚧 阻塞中': C.YELLOW,
+    '🔴 阻塞': C.YELLOW,
+    '⏸️ 已暂停': C.CYAN,
+    '✅ 已完成': C.GREEN,
+    '❌ 已取消': C.RED,
+}
+PRIORITY_COLOR = {
+    '🔴 紧急': C.RED,
+    '🟡 重要': C.YELLOW,
+    '🟢 普通': C.GREEN,
+}
+
+def fmt_status(s):
+    color = STATUS_COLOR.get(s, C.RESET)
+    return c(color, s)
+
+def fmt_priority(p):
+    color = PRIORITY_COLOR.get(p, C.RESET)
+    return c(color, p)
+
+
+def _norm_status_name(s):
+    """兼容新旧状态命名（旧: 🕐/🚧；新: 🆕/🔴）"""
+    return {
+        '🕐 待开始': '🆕 待开始',
+        '🚧 阻塞中': '🔴 阻塞',
+    }.get(s, s)
+
+
+_STATUS_OPTIONS_CACHE = None
+
+
+def _status_alias_candidates(status):
+    norm = _norm_status_name(status)
+    if norm == '🆕 待开始':
+        return ['🆕 待开始', '🕐 待开始']
+    if norm == '🔴 阻塞':
+        return ['🔴 阻塞', '🚧 阻塞中']
+    return [norm]
+
+
+def _status_options():
+    """读取任务表状态字段可用枚举，避免 InvalidFilter"""
+    global _STATUS_OPTIONS_CACHE
+    if _STATUS_OPTIONS_CACHE is not None:
+        return _STATUS_OPTIONS_CACHE
+    try:
+        c_ = cfg()
+        table_id = c_['tables']['tasks']['id']
+        r = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/fields?page_size=500')
+        for item in r.get('data', {}).get('items', []):
+            if item.get('field_name') == '状态':
+                options = item.get('property', {}).get('options', [])
+                _STATUS_OPTIONS_CACHE = {o.get('name') for o in options if o.get('name')}
+                return _STATUS_OPTIONS_CACHE
+    except Exception:
+        pass
+    _STATUS_OPTIONS_CACHE = set()
+    return _STATUS_OPTIONS_CACHE
+
+
+def _status_filter_conditions(statuses):
+    options = _status_options()
+    conds = []
+    for s in statuses:
+        picked = None
+        for candidate in _status_alias_candidates(s):
+            if not options or candidate in options:
+                picked = candidate
+                break
+        if picked:
+            conds.append({'field_name': '状态', 'operator': 'is', 'value': [picked]})
+    return conds
+
+# ── 打印任务（单行简洁版） ─────────────────────────────────────────
+def print_task_line(rec):
+    f = rec.get('fields', {})
+    rid = rec.get('record_id', '')
+    seq  = fv(f, '执行序号') or '-'
+    name = fv(f, '任务名称', truncate=30)
+    status   = fv(f, '状态')
+    priority = fv(f, '优先级')
+    phase = fv(f, '任务进展', truncate=20)
+    summary = fv(f, '结果摘要', truncate=40)
+    display_note = phase or summary
+    err_cnt = f.get('错误次数')
+    err_tag = ''
+    if err_cnt:
+        n = int(float(err_cnt))
+        if n > 0:
+            err_tag = c(C.RED if n >= MAX_ERROR_RETRIES else C.YELLOW, f' ❌{n}')
+    print(f"  {c(C.GRAY,'#'+seq):6s} {fmt_status(status):20s} {fmt_priority(priority):12s} "
+          f"{c(C.WHITE, name):35s}{err_tag}")
+    if display_note:
+        print(f"          {c(C.GRAY,'▶')} {c(C.CYAN, display_note)}")
+    print(f"          {c(C.GRAY, rid)}")
+
+# ── 打印任务（详情版） ────────────────────────────────────────────
+def print_task_detail(rec):
+    f = rec.get('fields', {})
+    rid = rec.get('record_id', '')
+    hr()
+    print(f"{c(C.BOLD+C.WHITE, fv(f,'任务名称'))}  {c(C.GRAY, rid)}")
+    err_cnt = f.get('错误次数')
+    err_str = ''
+    if err_cnt:
+        n = int(float(err_cnt))
+        if n > 0:
+            err_color = C.RED if n >= MAX_ERROR_RETRIES else C.YELLOW
+            err_str = f'  {c(err_color, f"❌{n}次错误")}'
+    print(f"  状态: {fmt_status(fv(f,'状态'))}  "
+          f"优先级: {fmt_priority(fv(f,'优先级'))}  "
+          f"序号: #{fv(f,'执行序号') or '-'}{err_str}")
+    for key, label in [
+        ('任务进展',   '📍 任务进展'),
+    ]:
+        v = fv(f, key)
+        if v: print(f"  {label}: {c(C.CYAN, v[:120])}")
+    # 任务进展
+    plan = fv(f, '任务进展')
+    if plan:
+        print(f"\n  {c(C.BOLD, '📋 任务进展')}:")
+        for line in plan[:400].replace('\\n', '\n').split('\n'):
+            if not line.strip(): continue
+            print(f"    {c(C.BLUE, line.strip())}")
+    # 时间行
+    times = []
+    for k, l in [('创建时间','创建'),('开始执行时间','开始'),('完成时间','完成')]:
+        v = fv(f, k)
+        if v: times.append(f'{l}:{v}')
+    if times: print(f"  {c(C.GRAY, '  '.join(times))}")
+    # 时长
+    dur = fv(f, '执行时长（秒，自动）')
+    tok = fv(f, 'Token 开销')
+    if dur or tok:
+        parts = []
+        if dur: parts.append(f'时长:{dur}s')
+        if tok: parts.append(f'Token:{tok}')
+        print(f"  {c(C.GRAY, '  '.join(parts))}")
+    # 多行字段
+    for key, label, color in [
+        ('原始指令',   '📋 原始指令',   C.GRAY),
+        ('结果摘要',   '🏁 结果摘要',   C.GREEN),
+    ]:
+        v = fv(f, key)
+        if v:
+            lines = v[:600].split('\n')
+            print(f"\n  {c(C.GRAY, label)}:")
+            for line in lines[:12]:
+                print(f"    {c(color, line)}")
+
+# ── 调度触发 ──────────────────────────────────────────────────────
+def _trigger_dispatch():
+    """后台触发 bm-dispatch.mjs --once，不阻塞当前命令"""
+    import subprocess
+    trigger_script = os.path.realpath(os.path.join(SCRIPT_DIR, 'bm-dispatch-trigger.sh'))
+    if os.path.exists(trigger_script):
+        try:
+            subprocess.Popen(
+                ['bash', trigger_script],
+                start_new_session=True
+            )
+        except Exception:
+            pass  # 调度失败不影响 bm 命令本身
+
+# ── TASK 子命令 ───────────────────────────────────────────────────
+
+def _auto_recall(c_, keywords, context='task'):
+    """自动召回：用关键词搜索日志表+记忆库，展示相关历史经验"""
+    log_table = c_['tables']['logs']['id']
+    mem_table = c_['tables']['memory']['id']
+    task_table = c_['tables']['tasks']['id']
+    hits = []
+
+    # 搜索执行日志表（服务端 contains）
+    for kw in keywords[:3]:  # 最多用3个关键词
+        if len(kw) < 2: continue
+        recs = search_records(log_table, {
+            'filter': {'conjunction': 'and', 'conditions': [
+                {'field_name': '内容', 'operator': 'contains', 'value': [kw]}
+            ]},
+            'sort': [{'field_name': '记录时间', 'desc': True}],
+            'field_names': ['内容', '关联任务ID', '类型'],
+            'page_size': 5
+        })
+        for r in recs:
+            rid = r.get('record_id', '')
+            if rid not in [h[0] for h in hits]:
+                hits.append((rid, 'log', r.get('fields', {}), kw))
+
+    # 搜索记忆库（服务端 contains）
+    for kw in keywords[:3]:
+        if len(kw) < 2: continue
+        recs = search_records(mem_table, {
+            'filter': {'conjunction': 'and', 'conditions': [
+                {'field_name': '内容', 'operator': 'contains', 'value': [kw]},
+                {'field_name': '是否激活', 'operator': 'is', 'value': [True]}
+            ]},
+            'field_names': ['标题', '内容', '类型'],
+            'page_size': 5
+        })
+        for r in recs:
+            rid = r.get('record_id', '')
+            if rid not in [h[0] for h in hits]:
+                hits.append((rid, 'mem', r.get('fields', {}), kw))
+
+    if not hits:
+        return
+
+    # 去重后最多展示 5 条，输出精简摘要（不展开内容，节省 token）
+    hits = hits[:5]
+    log_count = sum(1 for _, s, _, _ in hits if s == 'log')
+    mem_count = sum(1 for _, s, _, _ in hits if s == 'mem')
+    parts = []
+    if log_count: parts.append(f'日志 {log_count} 条')
+    if mem_count: parts.append(f'记忆 {mem_count} 条')
+    print(f'  📖 自动召回：找到 {len(hits)} 条相关记录（{"、".join(parts)}）')
+    print(f'  {c(C.GRAY, "（查看详情：bm log search <关键词>）")}'  )
+
+
+def _extract_keywords(text):
+    """从任务名/指令中提取搜索关键词（简单分词）"""
+    import re
+    # 去掉常见停用词和标点
+    stop = {'的', '了', '在', '是', '和', '与', '把', '将', '对', '从', '到', '用',
+            '为', '被', '让', '给', '按', '要', '能', '可以', '需要', '进行', '实现',
+            '优化', '修复', '添加', '更新', '完成', '处理', '支持', '使用', '功能'}
+    # 按中文/英文/数字分词
+    tokens = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z_]{3,}|[a-zA-Z_]+[0-9]+', text)
+    keywords = [t for t in tokens if t.lower() not in stop and len(t) >= 2]
+    # 去重保序
+    seen = set()
+    result = []
+    for k in keywords:
+        if k.lower() not in seen:
+            seen.add(k.lower())
+            result.append(k)
+    return result[:5]
+
+
+def task_add(args):
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    now_ms = int(time.time() * 1000)
+    priority_map = {'紧急': '🔴 紧急', '重要': '🟡 重要', '普通': '🟢 普通'}
+    priority = priority_map.get(args.priority, args.priority)
+    if not any(priority.startswith(p) for p in ['🔴','🟡','🟢']):
+        priority = '🟢 普通'
+    # 创建时间和执行序号由飞书自动填写，不需要传
+    fields = {
+        '任务名称':     args.name,
+        '状态':        '🔄 进行中',
+        '优先级':      priority,
+        '开始执行时间': now_ms,   # 任务启动时刻（不同于创建时间）
+        # 任务进展由 dispatch 自动规划填写，建任务时留空
+    }
+    if args.instruction: fields['原始指令'] = args.instruction
+    # ── 父任务：子任务内联模式（方案A：不建独立行）────────────────
+    if args.parent:
+        pr = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.parent}')
+        if pr.get('code') != 0:
+            err(f'父任务 {args.parent} 不存在，请检查ID是否正确')
+        pf = pr['data']['record']['fields']
+        pstatus = fv(pf, '状态')
+        if pstatus == '✅ 已完成':
+            warn(f'父任务已完成！建议确认是否要在已关闭的任务下创建子任务。')
+        # 追加子任务名到「任务进展」字段
+        current_plan = fv(pf, '任务进展') or ''
+        if current_plan and '子任务：' not in current_plan:
+            # 第一次加子任务，追加子任务段落
+            new_plan = current_plan.rstrip() + f'\n子任务：{args.name}'
+        elif '子任务：' in current_plan:
+            # 已有子任务段落，追加
+            new_plan = current_plan.rstrip() + f' → {args.name}'
+        else:
+            new_plan = f'子任务：{args.name}'
+        # 任务进展指向第一个子任务（如果还没开始）
+        phase = fv(pf, '任务进展') or ''
+        if not phase or phase == '阶段1-需求探索':
+            phase = f'📍{args.name}：待开始'
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.parent}',
+            {'fields': _task_progress_fields(phase=phase, plan=new_plan)})
+        ok(f'子任务已添加到父任务行')
+        print(f"   {c(C.WHITE, args.name)}")
+        print(f"   {c(C.GRAY, '↳ 父任务:')} {c(C.CYAN, args.parent)}")
+        done_hint = f'完成时运行: bm subtask done {args.parent} "{args.name}"'
+        print(f"\n   {c(C.GRAY, done_hint)}")
+        return
+
+    # ── 普通任务：创建独立行 ────────────────────────────────────
+    r = api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records',
+        {'fields': fields})
+    if r.get('code') == 0:
+        rid = r['data']['record']['record_id']
+        ok(f'任务已创建  {rid}')
+        print(f"   {c(C.WHITE, args.name)}")
+        print(f"   {fmt_priority(priority)}  {c(C.GRAY, datetime.now().strftime('%H:%M:%S'))}")
+        print(f"\n   {c(C.GRAY, f'完成时运行: bm task done {rid}')}")
+        # ── 任何新任务加入后：运行调度器给出建议 ──────────────────
+        print()
+        class _A: pass
+        task_next(_A())
+        # ── Manus原则：自动召回相关历史经验 ──────────────────────
+        search_text = args.name + ' ' + (args.instruction or '')
+        keywords = _extract_keywords(search_text)
+        if keywords:
+            _auto_recall(c_, keywords)
+        # ── 紧急任务：立即触发调度（自动中断低优先级任务）─────────
+        if priority.startswith('🔴'):
+            pass  # dispatch 由心跳驱动
+    else:
+        err(f'创建失败: {r.get("msg")}')
+
+def _show_next_tasks(c_):
+    """完成任务后，自动展示待开始/进行中/暂停/阻塞中的任务"""
+    table_id = c_['tables']['tasks']['id']
+    conditions = _status_filter_conditions(['🆕 待开始', '🔄 进行中', '⏸️ 已暂停', '🔴 阻塞'])
+    query = {
+        'sort': [{'field_name': '执行序号', 'desc': False}],
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数'],
+        'page_size': 5
+    }
+    if conditions:
+        query['filter'] = {'conjunction': 'or', 'conditions': conditions}
+    items = search_records(table_id, query)
+    if not items:
+        print(c(C.GREEN, '\n🎉 没有待处理任务，全部完成！'))
+        return
+    # 只展示最高优先级的下一个任务（精简输出，节省 token）
+    nxt = items[0]
+    nf = nxt['fields']
+    nid = nxt['record_id']
+    nname = fv(nf, '任务名称', 40)
+    npri = fv(nf, '优先级')
+    nphase = fv(nf, '任务进展')
+    hint = f'  [{nphase}]' if nphase else ''
+    total = len(items)
+    more = f'（共 {total} 个待处理）' if total > 1 else ''
+    print(f'  ⏭  下一步：{fmt_priority(npri)} {c(C.WHITE, nname)}{c(C.GRAY, hint)}  {c(C.GRAY, more)}')
+    print(f'  {c(C.GRAY, nid)}')
+
+def _interrupt_check(c_, current_id=None):
+    """中断检查：是否有更高优先级任务需要打断当前任务（每个阶段/子任务完成后调用）"""
+    table_id = c_['tables']['tasks']['id']
+    conditions = _status_filter_conditions(['🔄 进行中', '🆕 待开始', '⏸️ 已暂停'])
+    query = {
+        'field_names': ['任务名称', '状态', '优先级', '执行序号'],
+        'page_size': 20
+    }
+    if conditions:
+        query['filter'] = {'conjunction': 'or', 'conditions': conditions}
+    candidates = search_records(table_id, query)
+    if not candidates:
+        return
+
+    def sort_key(r):
+        f = r.get('fields', {})
+        return (_priority_rank(fv(f, '优先级')), _status_rank(fv(f, '状态')), int(fv(f, '执行序号') or 999))
+
+    ranked = sorted(candidates, key=sort_key)
+    top = ranked[0]
+    top_id   = top.get('record_id', '')
+    tf       = top.get('fields', {})
+    top_name = fv(tf, '任务名称')
+    top_pri  = fv(tf, '优先级')
+    top_sta  = fv(tf, '状态')
+
+    # 最高优先级任务就是当前任务 → 无需打断
+    if top_id == current_id:
+        print(f'  {c(C.GRAY, "✔ 中断检查：无更高优先级任务，继续执行")}')
+        return
+
+    # 最高优先级是进行中且不是 current → 并发情况（理论上不应出现）
+    if top_sta == '🔄 进行中':
+        print(f'  {c(C.GRAY, "✔ 中断检查：无更高优先级任务")}')
+        return
+
+    # 有更高优先级的待开始/已暂停任务
+    print(f'\n  {c(C.YELLOW, "⚠️  中断提示")}：有更高优先级任务 {fmt_priority(top_pri)} 「{top_name}」')
+    print(f'  {c(C.GRAY, top_id)}')
+    if current_id:
+        hint = f'bm task interrupt {current_id} -m "断点描述"  然后执行该任务'
+        print(f'  → {c(C.GRAY, hint)}')
+
+
+def _count_logs_by_type(c_, task_id):
+    """查询某任务的日志，按类型统计数量，返回 dict"""
+    log_table = c_['tables']['logs']['id']
+    recs = search_records(log_table, {
+        'filter': {'conjunction': 'and', 'conditions': [
+            {'field_name': '关联任务ID', 'operator': 'is', 'value': [task_id]}
+        ]},
+        'field_names': ['类型'],
+        'page_size': 200
+    })
+    counts = {}
+    for rec in recs:
+        t = fv(rec.get('fields', {}), '类型')
+        if t:
+            counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def task_token_snap(args):
+    """bm task token-snap <task_id> <in_tokens>
+    记录任务开始时的 token 快照，供 task done 计算消耗 delta。
+    由 agent 在 bm task add 后立即调用（先查 session_status 获取当前 token 数）。
+    """
+    state = _load_state()
+    state[f'token_snap_{args.task_id}'] = {
+        'in': int(float(args.in_tokens)),
+        'at': int(time.time())
+    }
+    _save_state(state)
+    print(f"💾 token 快照已记录: {int(float(args.in_tokens)):,} in-tokens @ {args.task_id}")
+
+
+def task_done(args):
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    now_ms = int(time.time() * 1000)
+    done_fields = {'状态': '✅ 已完成', '完成时间': now_ms}
+    done_fields.update(_task_progress_fields(phase='✅ 交付完成', plan='✅ 交付完成'))
+    # 读取当前记录
+    rec = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}')
+    rec_fields = rec.get('data', {}).get('record', {}).get('fields', {})
+    # ── 防呆①：任务状态检查 ─────────────────────────────────────
+    cur_status = fv(rec_fields, '状态')
+    if cur_status == '✅ 已完成':
+        warn(f'任务已经是完成状态，无需重复操作')
+        return
+    if _norm_status_name(cur_status) == '🆕 待开始':
+        warn(f'任务从未开始执行（待开始状态）！')
+        print(f'   先运行：{c(C.GRAY, f"bm task up {args.id} 状态 🔄进行中")}')
+        print(f'   如确认要直接完成（跳过执行），请加 --force 参数')
+        if not getattr(args, 'force', False):
+            return
+    # 自动计算时长
+    start_ts = rec_fields.get('开始执行时间')
+    duration_sec = None
+    if start_ts and isinstance(start_ts, (int, float)):
+        duration_sec = round((now_ms - start_ts) / 1000, 0)
+        # 实际耗时已删，公式字段自动计算，不需要手动写入
+    # ── Token 开销：优先用 --tokens-now 自动算 delta，其次用 -t 手动指定 ──
+    token_cost = 0
+    tokens_now = getattr(args, 'tokens_now', 0)
+    if tokens_now:
+        state = _load_state()
+        snap = state.get(f'token_snap_{args.id}')
+        if snap:
+            token_cost = max(0, tokens_now - snap['in'])
+            # 清除快照
+            del state[f'token_snap_{args.id}']
+            _save_state(state)
+        else:
+            token_cost = tokens_now  # 没有快照就直接用当前值
+    elif args.tokens:
+        token_cost = args.tokens
+    if token_cost:
+        done_fields['Token 开销'] = token_cost
+    # 结果摘要
+    if args.summary:
+        done_fields['结果摘要'] = args.summary
+    r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}',
+        {'fields': done_fields})
+    if r.get('code') == 0:
+        name = fv(rec_fields, '任务名称')
+        parts = [f'任务完成: {name}']
+        if duration_sec is not None: parts.append(f'{int(duration_sec)}秒')
+        if token_cost: parts.append(f'Token {token_cost:,}')
+        ok('  '.join(parts))
+        # ── 日志计数（子任务需从父任务日志中按前缀过滤）──────────────
+        if not args.summary:
+            warn(f'建议填写结果摘要: bm task done {args.id} -s "..."')
+        # ── 沉淀提示（finding + error）──────────────────────────
+        log_table = c_['tables']['logs']['id']
+        error_cnt = int(rec_fields.get('错误次数') or 0)
+        if error_cnt > 0:
+            print(f'{C.RED}⚠  有 {error_cnt} 条错误记录{C.RESET}')
+            print(f'   {c(C.GRAY, f"bm log ls {args.id} --type error")}  ← 查看错误详情')
+        # ── Manus原则⑤：完整性检查 ──────────────────────────────
+        log_counts = _count_logs_by_type(c_, args.id)
+        has_plan = log_counts.get('📋 计划', 0) > 0
+        has_milestone = log_counts.get('🏁 里程碑', 0) > 0
+        if not has_plan:
+            warn(f'任务没有 plan 日志')
+        if not has_milestone:
+            warn(f'任务没有 milestone 日志（建议至少记录一个里程碑）')
+        # 清理注意力计数器
+        _reset_log_count(args.id)
+        # ── 自动扫下一个任务 ──────────────────────────────────────
+        _show_next_tasks(c_)
+        # ── 自动调度下一个任务 ────────────────────────────────────
+        pass  # dispatch 由心跳驱动
+    else:
+        err(f'更新失败: {r.get("msg")}')
+
+def task_update(args):
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    fields = {args.field: args.value}
+    # 状态→进行中 时自动补开始时间
+    if args.field == '状态' and '进行中' in args.value:
+        rec = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}')
+        existing = rec.get('data', {}).get('record', {}).get('fields', {}).get('开始执行时间')
+        if not existing:
+            fields['开始执行时间'] = int(time.time() * 1000)
+            info(f'已自动填写开始执行时间')
+    r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}',
+        {'fields': fields})
+    if r.get('code') == 0:
+        ok(f'[{args.field}] 已更新')
+        # 显示截断值
+        val_preview = args.value[:80].replace('\n', '↵')
+        print(f'   {c(C.CYAN, val_preview)}')
+    else:
+        err(f'更新失败: {r.get("msg")}  {r}')
+
+def notify_owner(task_id, task_name, error_count, last_error):
+    """向 owner 发飞书消息，告知任务因错误过多已阻塞"""
+    msg = (
+        f"🚨 任务出错过多，需要您介入！\n\n"
+        f"📋 任务：{task_name}（{task_id}）\n"
+        f"❌ 已失败：{error_count} 次（上限 {MAX_ERROR_RETRIES} 次）\n"
+        f"📝 最近错误：{last_error[:200]}\n\n"
+        f"任务已自动标记为【阻塞中】，等待您处理。"
+    )
+    body = {
+        'receive_id': OWNER_OPEN_ID,
+        'msg_type': 'text',
+        'content': json.dumps({'text': msg}, ensure_ascii=False)
+    }
+    r = api('POST', '/im/v1/messages?receive_id_type=open_id', body)
+    if r.get('code') == 0:
+        warn('已通知 owner 介入处理')
+    else:
+        warn(f'通知发送失败（不影响任务状态）: {r.get("msg")}')
+
+def task_block_internal(c_, task_id, reason):
+    """内部调用：直接用 id 阻塞任务"""
+    table_id = c_['tables']['tasks']['id']
+    r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{task_id}',
+        {'fields': {'状态': _norm_status_name('🚧 阻塞中')}})
+    return r.get('code') == 0
+
+def task_block(args):
+    c_ = cfg()
+    if task_block_internal(c_, args.id, args.reason):
+        warn(f'任务 {args.id} 已标记阻塞')
+        print(f'   原因: {c(C.YELLOW, args.reason)}')
+    else:
+        err(f'更新失败')
+
+def task_interrupt(args):
+    """打断当前任务，保存断点，让出执行权给更高优先级任务"""
+    c_ = cfg()
+    table_id  = c_['tables']['tasks']['id']
+    log_table = c_['tables']['logs']['id']
+    # 读取当前任务信息
+    rec = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}')
+    if rec.get('code') != 0:
+        err(f'找不到任务: {args.id}')
+    f = rec['data']['record']['fields']
+    name = fv(f, '任务名称')
+    phase = fv(f, '任务进展') or '未设置'
+    note = args.note or '手动打断，待恢复'
+    # 写 checkpoint 日志
+    checkpoint_content = f'[打断断点]\n任务进展：{phase}\n恢复提示：{note}'
+    api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table}/records',
+        {'fields': {
+            '内容': checkpoint_content,
+            '关联任务ID': args.id,
+            '类型': '💾 断点快照',
+            '阶段': phase,
+        }})
+    # 更新任务状态为已暂停
+    api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}',
+        {'fields': {
+            '状态': '⏸️ 已暂停',
+        }})
+    print(f'\n{c(C.CYAN, "⏸️  任务已暂停")}  {c(C.WHITE, name)}')
+    print(f'   断点已保存：{c(C.GRAY, note[:80])}')
+    print(f'   恢复时运行：{c(C.GRAY, f"bm task up {args.id} 状态 🔄进行中")}')
+
+def task_ls(args):
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    if args.all:
+        statuses = ['🆕 待开始', '🔄 进行中', '⏸️ 已暂停', '🔴 阻塞', '✅ 已完成', '❌ 已取消']
+    elif args.status:
+        status_map = {
+            '待开始':'🆕 待开始','进行中':'🔄 进行中',
+            '阻塞':'🔴 阻塞','阻塞中':'🔴 阻塞',
+            '完成':'✅ 已完成','已完成':'✅ 已完成',
+            '暂停':'⏸️ 已暂停','已暂停':'⏸️ 已暂停',
+        }
+        statuses = [_norm_status_name(status_map.get(s.strip(), s.strip())) for s in args.status.split(',')]
+    else:
+        statuses = ['🔄 进行中', '⏸️ 已暂停', '🔴 阻塞']
+
+    query = {
+        'sort': [{'field_name': '优先级', 'desc': False},
+                 {'field_name': '执行序号', 'desc': False}],
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '结果摘要', '错误次数']
+    }
+    conditions = _status_filter_conditions(statuses)
+    if conditions:
+        query['filter'] = {'conjunction': 'or' if len(conditions)>1 else 'and', 'conditions': conditions}
+    recs = search_records(table_id, query)
+    label = '、'.join(statuses)
+    print(f'\n{c(C.BOLD, "📋 任务列表")}  {c(C.GRAY, label)}  ({len(recs)} 个)\n')
+    if not recs:
+        info('没有符合条件的任务')
+        return
+    for rec in recs:
+        print_task_line(rec)
+        print()
+
+def task_resume(args):
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    log_table = c_['tables']['logs']['id']
+    recs_raw = search_records(table_id, {
+        'filter': {'conjunction': 'or', 'conditions': [
+            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
+            {'field_name': '状态', 'operator': 'is', 'value': ['⏸️ 已暂停']},
+            {'field_name': '状态', 'operator': 'is', 'value': ['🚧 阻塞中']},
+        ]},
+        'sort': [{'field_name': '执行序号', 'desc': False}]
+    })
+    # 暂停任务优先：⏸️ → 🔄 → 🚧
+    STATUS_ORDER = {'⏸️ 已暂停': 0, '🔄 进行中': 1, '🚧 阻塞中': 2}
+    recs = sorted(recs_raw, key=lambda r: STATUS_ORDER.get(
+        (r.get('fields') or {}).get('状态', [''])[0] if isinstance((r.get('fields') or {}).get('状态'), list)
+        else (r.get('fields') or {}).get('状态', ''), 99))
+    if not recs:
+        recs = search_records(table_id, {
+            'filter': {'conjunction': 'and', 'conditions': [
+                {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
+            ]},
+            'sort': [{'field_name': '执行序号', 'desc': False}]
+        })
+        if not recs:
+            ok('没有待处理的任务 🎉')
+            return
+        info('没有进行中任务，以下是待开始：')
+
+    print(f'\n{c(C.BOLD+C.BLUE, "🔄 5问重启检查")}  共 {len(recs)} 个任务\n')
+    for rec in recs:
+        f = rec.get('fields', {})
+        rid = rec.get('record_id', '')
+        hr()
+        print(f"{c(C.BOLD+C.WHITE, fv(f,'任务名称'))}  {c(C.GRAY, rid)}")
+        print(f"  {fmt_status(fv(f,'状态'))}  {fmt_priority(fv(f,'优先级'))}")
+        print()
+        # 5问
+        phase    = fv(f, '任务进展') or '未设置'
+        goal     = fv(f, '原始指令', truncate=120) or fv(f, '任务名称')
+
+        print(f"  {c(C.BOLD,'📍 我在哪里？')}  {c(C.CYAN, phase)}")
+
+        print(f"  {c(C.BOLD,'🏁 目标是什么？')} {c(C.WHITE, goal[:100])}")
+        # 最近日志条目（动态加载）
+        recent_logs = search_records(log_table, {
+            'filter': {'conjunction': 'and', 'conditions': [
+                {'field_name': '关联任务ID', 'operator': 'is', 'value': [rid]}
+            ]},
+            'sort': [{'field_name': '记录时间', 'desc': True}],
+            'field_names': ['内容', '类型', '阶段', '记录时间'],
+            'page_size': 3
+        })
+        if recent_logs:
+            print(f"  {c(C.BOLD,'✅ 最近进度：')}")
+            for lg in recent_logs:
+                lf = lg.get('fields', {})
+                ltype = fv(lf, '类型')
+                lcontent = fv(lf, '内容', truncate=100)
+                print(f"     {c(C.GRAY, ltype)}  {lcontent}")
+        # ── Manus原则：自动召回相关记忆 ──────────────────────────
+        task_name = fv(f, '任务名称') or ''
+        instruction = fv(f, '原始指令') or ''
+        keywords = _extract_keywords(task_name + ' ' + instruction)
+        if keywords:
+            _auto_recall(c_, keywords, context='resume')
+        print()
+    hr()
+
+def task_phase(args):
+    """快速更新任务进展"""
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}',
+        {'fields': _task_progress_fields(phase=args.phase)})
+    if r.get('code') == 0:
+        ok(f'阶段已更新: {args.phase}')
+        _interrupt_check(c_, args.id)
+    else:
+        err(f'更新失败: {r.get("msg")}')
+
+def task_search(args):
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    kw = args.keyword
+    # 服务端多字段 contains 筛选，避免全表拉取
+    search_fields = ['任务名称', '原始指令', '结果摘要']
+    conditions = [{'field_name': fn, 'operator': 'contains', 'value': [kw]} for fn in search_fields]
+    found = search_records(table_id, {
+        'filter': {'conjunction': 'or', 'conditions': conditions},
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '结果摘要', '错误次数'],
+        'sort': [{'field_name': '执行序号', 'desc': True}],
+    })
+    print(f'\n{c(C.BOLD, "🔍 搜索结果")}  [{kw}]  ({len(found)} 个)\n')
+    for rec in found:
+        print_task_line(rec)
+        print()
+
+def _priority_rank(p):
+    """优先级数值（越小越高）"""
+    return {'🔴 紧急': 0, '🟡 重要': 1, '🟢 普通': 2}.get(p, 9)
+
+def _status_rank(s):
+    """状态数值（进行中最优先）"""
+    s = _norm_status_name(s)
+    return {'🔄 进行中': 0, '⏸️ 已暂停': 1, '🆕 待开始': 2, '🔴 阻塞': 9}.get(s, 9)
+
+def task_next(args):
+    """调度器：扫描所有未完成任务，推荐当前应该执行的任务"""
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    # 拉取所有活跃任务（待开始+进行中+已暂停）
+    candidates = search_records(table_id, {
+        'filter': {'conjunction': 'or', 'conditions': _status_filter_conditions([
+            '🔄 进行中', '🆕 待开始', '⏸️ 已暂停'
+        ])},
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数'],
+        'page_size': 50
+    })
+    if not candidates:
+        ok('没有待处理任务，全部完成 🎉')
+        return
+
+    # 按优先级 → 状态 → 序号 排序
+    def sort_key(r):
+        f = r.get('fields', {})
+        pri = fv(f, '优先级')
+        sta = fv(f, '状态')
+        seq = int(fv(f, '执行序号') or 999)
+        return (_priority_rank(pri), _status_rank(sta), seq)
+
+    ranked = sorted(candidates, key=sort_key)
+    top = ranked[0]
+    tf = top.get('fields', {})
+    top_id   = top.get('record_id', '')
+    top_name = fv(tf, '任务名称')
+    top_pri  = fv(tf, '优先级')
+    top_sta  = fv(tf, '状态')
+    top_phase = fv(tf, '任务进展') or ''
+
+    print(f'\n{c(C.BOLD, "🎯 调度建议")}\n')
+
+    # 判断是否需要切换
+    in_progress = [r for r in candidates if _norm_status_name(fv(r.get('fields',{}), '状态')) == '🔄 进行中']
+    current = in_progress[0] if in_progress else None
+
+    need_switch = False   # 是否需要切换（用于 --notify 判断）
+
+    if top_sta == '🔄 进行中':
+        # 最高优先级任务已经在执行
+        print(f'  {c(C.GREEN, "✅ 当前任务优先级最高，继续执行：")}')
+        phase_hint = f'  [{top_phase}]' if top_phase else ''
+        print(f'  {fmt_priority(top_pri)}  {c(C.WHITE, top_name)}{c(C.GRAY, phase_hint)}')
+        print(f'  {c(C.GRAY, top_id)}')
+    else:
+        need_switch = True
+        # 有更高优先级的待开始/暂停任务
+        cur_name = fv(current.get('fields', {}), '任务名称') if current else '（无）'
+        cur_pri  = fv(current.get('fields', {}), '优先级') if current else ''
+        print(f'  {c(C.YELLOW, "⚠  建议切换任务！")}')
+        if current:
+            print(f'  当前: {fmt_priority(cur_pri)}  {c(C.GRAY, cur_name)}')
+        print(f'  {c(C.GREEN, "→ 应做")}:  {fmt_priority(top_pri)}  {c(C.WHITE, top_name)}')
+        print(f'  {c(C.GRAY, top_id)}')
+        if _norm_status_name(top_sta) == '🆕 待开始':
+            print(f'\n  开始执行：{c(C.GRAY, f"bm task up {top_id} 状态 🔄进行中")}')
+        elif top_sta == '⏸️ 已暂停':
+            print(f'\n  恢复执行：{c(C.GRAY, f"bm task up {top_id} 状态 🔄进行中")}')
+
+    # ── --notify：发飞书通知（仅当需要切换且最高优先是紧急时）─────
+    notify = getattr(args, 'notify', False)
+    if notify and need_switch and top_pri == '🔴 紧急':
+        cur_info = f'（当前执行：{cur_name}）' if current else '（当前无进行中任务）'
+        msg = (
+            f"🚨 调度提醒：有紧急任务等待执行！\n\n"
+            f"📋 紧急任务：{top_name}\n"
+            f"📌 状态：{top_sta}\n"
+            f"🔑 ID：{top_id}\n"
+            f"{cur_info}\n\n"
+            f"请优先处理此任务。"
+        )
+        r = api('POST', '/im/v1/messages?receive_id_type=open_id', {
+            'receive_id': OWNER_OPEN_ID,
+            'msg_type': 'text',
+            'content': json.dumps({'text': msg}, ensure_ascii=False)
+        })
+        if r.get('code') == 0:
+            warn('已发送飞书提醒给 owner')
+        else:
+            warn(f'飞书通知发送失败: {r.get("msg")}')
+
+    # 显示完整优先级队列（最多5个）
+    if len(ranked) > 1:
+        print(f'\n  {c(C.GRAY, "── 优先级队列 ──")}')
+        for i, r in enumerate(ranked[:5]):
+            f = r.get('fields', {})
+            rid = r.get('record_id', '')
+            sta = fv(f, '状态')
+            pri = fv(f, '优先级')
+            name = fv(f, '任务名称', 25)
+            phase = fv(f, '任务进展', 15) or ''
+            marker = c(C.GREEN, '▶') if sta == '🔄 进行中' else c(C.GRAY, f'{i+1}.')
+            phase_str = c(C.GRAY, f' [{phase}]') if phase else ''
+            print(f'  {marker} {fmt_priority(pri)}  {c(C.WHITE, name)}{phase_str}')
+        if len(ranked) > 5:
+            print(f'  {c(C.GRAY, f"  ... 还有 {len(ranked)-5} 个任务")}')
+
+def subtask_add_batch(args):
+    """bm subtask add <parent_id> <名称1> [名称2] ...
+    批量添加子任务到父任务（1次GET + 1次PUT，比逐个添加节省 N*2-2 次API调用）
+    """
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    parent_id = args.parent_id
+    names = args.names
+
+    pr = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}')
+    if pr.get('code') != 0:
+        err(f'父任务 {parent_id} 不存在')
+    pf = pr['data']['record']['fields']
+    if fv(pf, '状态') == '✅ 已完成':
+        warn('父任务已完成！')
+
+    current_plan = fv(pf, '任务进展') or ''
+    if '子任务：' in current_plan:
+        # 已有子任务行：直接替换（不追加），避免 log add plan 和 subtask add 双写导致重复
+        idx = current_plan.find('子任务：')
+        rest = current_plan[idx + len('子任务：'):]
+        eol = rest.find('\n')
+        after = rest[eol:] if eol >= 0 else ''
+        new_plan = current_plan[:idx] + '子任务：' + ' → '.join(names) + after
+    else:
+        new_plan = (current_plan.rstrip() + '\n子任务：' + ' → '.join(names)).strip()
+
+    phase = f'📍{names[0]}：待开始'
+    api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
+        {'fields': _task_progress_fields(phase=phase, plan=new_plan)})
+
+    ok(f'批量添加 {len(names)} 个子任务 → {c(C.GRAY, parent_id)}')
+    print(f'   {c(C.CYAN, "子任务：")} {c(C.WHITE, " → ".join(names))}')
+    saved = len(names) * 2 - 2
+    if saved > 0:
+        print(f'   {c(C.GRAY, f"节省 {saved} 次API调用（vs逐个 bm task add --parent）")}')
+
+
+
+def _parse_subtasks(plan_txt):
+    """从任务进展字段解析子任务名称列表"""
+    # 处理字面量 \n 和真正的换行
+    lines = plan_txt.replace('\\n', '\n').split('\n')
+    for line in lines:
+        line = line.strip()
+        if line.startswith('子任务') and ('：' in line or ':' in line):
+            # "子任务：调研 → 开发 → 上线" or "子任务：✅调研 → 开发 → ✅上线"
+            parts = line.split('：', 1)[-1] if '：' in line else line.split(':', 1)[-1]
+            names = [n.strip().lstrip('✅').strip() for n in parts.split('→')]
+            return [n for n in names if n]
+    return []
+
+
+def subtask_done(args):
+    """bm subtask done <parent_id> <subtask_name> [-s 摘要]"""
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    log_table_id = c_['tables']['logs']['id']
+    parent_id = args.parent_id
+    subtask_name = args.subtask_name
+    summary = args.summary or f'{subtask_name} 完成'
+
+    # 读父任务
+    pr = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}')
+    if pr.get('code') != 0:
+        err(f'父任务 {parent_id} 不存在')
+    pf = pr['data']['record']['fields']
+
+    # 从「任务进展」字段解析子任务列表
+    plan_txt = fv(pf, '任务进展') or ''
+    subtasks = _parse_subtasks(plan_txt)
+    if not subtasks:
+        err(f'父任务没有子任务（任务进展中未找到"子任务："段落）')
+
+    if subtask_name not in subtasks:
+        err(f'子任务「{subtask_name}」未找到\n当前子任务: {", ".join(subtasks)}')
+
+    # 标记完成：只在「子任务：」行中更新
+    lines = plan_txt.replace('\\n', '\n').split('\n')
+    new_lines = []
+    for line in lines:
+        if line.strip().startswith('子任务') and ('：' in line or ':' in line):
+            # 只在子任务行中替换
+            line = line.replace(f'✅{subtask_name}', f'✅{subtask_name}')  # 已完成的不动
+            line = line.replace(subtask_name, f'✅{subtask_name}')
+            line = line.replace('✅✅', '✅')
+        new_lines.append(line)
+    new_plan = '\n'.join(new_lines)
+
+    # 统计完成情况
+    done_count = sum(1 for s in subtasks if f'✅{s}' in new_plan)
+    total_count = len(subtasks)
+    all_done = done_count == total_count
+
+    # 更新任务进展
+    if all_done:
+        phase = '✅ 全部完成'
+    else:
+        next_sub = next((s for s in subtasks if f'✅{s}' not in new_plan), None)
+        phase = f'📍{next_sub}' if next_sub else '✅ 全部完成'
+
+    update_fields = _task_progress_fields(phase=phase, plan=new_plan)
+
+    # 写 milestone 日志
+    api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records',
+        {'fields': {
+            '关联任务ID': parent_id,
+            '类型': '🏁 里程碑',
+            '内容': f'[{subtask_name}] ✅ 完成：{summary}',
+        }})
+
+    if all_done:
+        now_ms = int(time.time() * 1000)
+        done_summary = f'全部 {total_count} 个子任务已完成'
+        update_fields.update({
+            '状态': '✅ 已完成',
+            '完成时间': now_ms,
+            '结果摘要': done_summary,
+        })
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
+            {'fields': update_fields})
+        api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records',
+            {'fields': {
+                '关联任务ID': parent_id,
+                '类型': '🏁 里程碑',
+                '内容': f'✅ 父任务自动完成：{done_summary}',
+            }})
+        ok(f'子任务完成: {subtask_name}  [{done_count}/{total_count}]')
+        print(f"   {c(C.GRAY, '父任务进度：')} {c(C.CYAN, new_plan[new_plan.find('子任务'):].split(chr(10))[0][:60])}")
+        print(f"\n{c(C.GREEN, '🎉 所有子任务已完成 → 父任务已自动标记完成！')}")
+        _show_next_tasks(c_)
+        # ── 自动调度下一个任务 ────────────────────────────────────
+        pass  # dispatch 由心跳驱动
+    else:
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
+            {'fields': update_fields})
+        ok(f'子任务完成: {subtask_name}  [{done_count}/{total_count}]')
+        plan_line = new_plan[new_plan.find('子任务'):].split('\n')[0] if '子任务' in new_plan else ''
+        print(f"   {c(C.GRAY, '父任务进度：')} {c(C.CYAN, plan_line[:60])}")
+        next_sub = next((s for s in subtasks if f'✅{s}' not in new_plan), None)
+        if next_sub:
+            print(f"   {c(C.CYAN, '→ 下一步：')} {c(C.WHITE, next_sub)}")
+        _interrupt_check(c_, parent_id)
+        # ── 自动调度下一个任务 ────────────────────────────────────
+        pass  # dispatch 由心跳驱动
+
+
+def subtask_phase(args):
+    """bm subtask phase <parent_id> <subtask_name> <step>
+    更新「任务进展」为指定子任务的当前步骤。
+    """
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    parent_id = args.parent_id
+    subtask_name = args.subtask_name
+    step = args.step
+
+    # 读父任务
+    pr = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}')
+    if pr.get('code') != 0:
+        err(f'父任务 {parent_id} 不存在')
+    pf = pr['data']['record']['fields']
+
+    # 验证子任务存在
+    plan_txt = fv(pf, '任务进展') or ''
+    subtasks = _parse_subtasks(plan_txt)
+    if subtask_name not in subtasks:
+        err(f'子任务「{subtask_name}」未找到\n当前子任务: {", ".join(subtasks)}')
+
+    # 只更新任务进展
+    phase = f'📍{subtask_name}：{step}'
+    r = api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{parent_id}',
+        {'fields': _task_progress_fields(phase=phase)})
+    if r.get('code') == 0:
+        ok(f'任务进展已更新')
+        print(f"   {c(C.CYAN, '📍')} {c(C.WHITE, f'{subtask_name}：{step}')}")
+    else:
+        err(f'更新失败: {r.get("msg")}')
+
+
+
+def task_show(args):
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    r = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{args.id}')
+    rec = r.get('data', {}).get('record')
+    if not rec:
+        err(f'找不到记录: {args.id}')
+    print_task_detail(rec)
+
+    hr()
+
+# ── LOG 子命令 ────────────────────────────────────────────────────
+LOG_TYPE_MAP = {
+    'plan':      '📋 计划',
+    'finding':   '🔍 发现',
+    'error':     '❌ 错误',
+    'decision':  '✅ 决策',
+    'milestone': '🏁 里程碑',
+    'progress':  '📝 进度',
+    'tool':      '🔧 工具结果',
+    'resource':  '🔗 资源',       # URL/文件路径，压缩可恢复原则
+    'checkpoint': '💾 断点快照',  # 长断点上下文（>500字时，不写任务表，写这里）
+}
+
+# ── Manus 原则：状态文件（注意力刷新计数器）──────────────────────
+STATE_FILE = '/root/.openclaw/workspace/.bm_state.json'
+
+def _load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
+
+def _save_state(state):
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+def _bump_log_count(task_id):
+    """每次 log_add 后递增计数器，返回当前计数"""
+    state = _load_state()
+    key = f'log_count_{task_id}'
+    state[key] = state.get(key, 0) + 1
+    _save_state(state)
+    return state[key]
+
+def _reset_log_count(task_id):
+    state = _load_state()
+    state.pop(f'log_count_{task_id}', None)
+    _save_state(state)
+
+def upload_file(file_path, app_token):
+    """上传文件到飞书，返回 file_token"""
+    import os, mimetypes
+    token = get_token()
+    filename = os.path.basename(file_path)
+    with open(file_path, 'rb') as f:
+        file_data = f.read()
+    file_size = len(file_data)
+    mime = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+    boundary = 'BtUploadBoundary'
+    def part(name, value):
+        return (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode()
+    body = (
+        part('file_name', filename) +
+        part('parent_type', 'bitable_file') +
+        part('parent_node', app_token) +
+        part('size', str(file_size)) +
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n'.encode() +
+        file_data +
+        f'\r\n--{boundary}--\r\n'.encode()
+    )
+    req = urllib.request.Request(
+        'https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
+        data=body, method='POST',
+        headers={'Authorization': f'Bearer {token}',
+                 'Content-Type': f'multipart/form-data; boundary={boundary}'})
+    try:
+        r = json.loads(urllib.request.urlopen(req).read())
+        if r.get('code') == 0:
+            return r['data']['file_token']
+        else:
+            warn(f'文件上传失败: [{r.get("code")}] {r.get("msg")}')
+            return None
+    except Exception as e:
+        warn(f'文件上传异常: {e}')
+        return None
+
+def log_add(args):
+    c_ = cfg()
+    log_table  = c_['tables']['logs']['id']
+    task_table = c_['tables']['tasks']['id']
+    ltype = LOG_TYPE_MAP.get(args.type, args.type)
+
+    # ── 读取任务记录（用于状态检查 + 错误计数）────────────────────
+    task_rec = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}')
+    task_fields = task_rec['data']['record']['fields'] if task_rec.get('code') == 0 else {}
+
+    # ── Manus原则④：plan 必须先写检查（本地缓存，省一次 API）──
+    PLAN_TYPE = LOG_TYPE_MAP.get('plan', '📋 计划')
+    if ltype != PLAN_TYPE and args.type != 'plan':
+        state = _load_state()
+        plan_key = f'has_plan_{args.task_id}'
+        if not state.get(plan_key):
+            # 检查任务表「任务进展」字段是否有内容（已在 task_fields 里，不需要额外 API）
+            has_plan = bool(fv(task_fields, '任务进展'))
+            if has_plan:
+                state[plan_key] = True
+                _save_state(state)
+            else:
+                warn(f'还没写 plan 日志！建议先写：bm log add {args.task_id} plan "目标：...\\n阶段：..."')
+
+    # ── Manus原则①：内容长度约束（自动截断+警告）─────────────────
+    content_text = args.content
+    if len(content_text) > 500:
+        warn(f'内容超过 500 字（{len(content_text)} 字），已自动截断。超出部分请用 --file 附件')
+        content_text = content_text[:500]
+
+    # ── 防呆③：对已完成/已取消任务写 error 日志 → 拒绝 ──────────
+    if args.type == 'error':
+        task_status = fv(task_fields, '状态')
+        if task_status in ('✅ 已完成', '❌ 已取消'):
+            err(f'任务已{task_status}，不能再写入错误日志。如需记录请先重开任务。')
+
+    # ── 错误计数 + 门禁 ──────────────────────────────────────
+    attempt_num = args.attempt or 0
+    is_error = (args.type == 'error')
+    new_error_count = None
+
+    if is_error:
+        cur = int(task_fields.get('错误次数') or 0) if task_fields else 0
+        if cur >= 2:
+            print(f'{C.YELLOW}⚠  第 {cur+1} 次错误！核心铁律：永远不要重复失败的动作。{C.RESET}')
+            print(f'   {c(C.GRAY, "请确认已改变方法再继续（查看前次错误：bm log ls " + args.task_id + " --type error）")}')
+        new_error_count = cur + 1
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}',
+            {'fields': {'错误次数': new_error_count}})
+        attempt_num = new_error_count
+        if not task_fields:
+            warn(f'读取任务记录失败，错误次数不自动更新')
+
+    # ── 写入 Base 执行日志表（plan 类型同时写任务表「任务进展」）──
+    PLAN_TYPE = LOG_TYPE_MAP.get('plan', '📋 计划')
+    if ltype == PLAN_TYPE:
+        plan_content = content_text[:300]
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}',
+            {'fields': _task_progress_fields(plan=plan_content)})
+        print(f"   {c(C.BLUE, '📋 规划 →')} 任务表「任务进展」字段")
+        # 缓存：标记该任务已有 plan
+        state = _load_state()
+        state[f'has_plan_{args.task_id}'] = True
+        _save_state(state)
+    fields = {
+        '内容': content_text,
+        '关联任务ID': args.task_id,
+        '类型': ltype,
+    }
+    if args.phase: fields['阶段'] = args.phase
+    if attempt_num: pass  # 错误次数已在任务表统计
+
+    if args.file:
+        if not os.path.exists(args.file):
+            err(f'文件不存在: {args.file}')
+        info(f'上传文件: {os.path.basename(args.file)} ...')
+        file_token = upload_file(args.file, c_['app_token'])
+        if file_token:
+            fields['附件'] = [{'file_token': file_token}]
+            ok(f'文件已上传: {file_token[:20]}...')
+
+    r = api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table}/records',
+        {'fields': fields})
+    if r.get('code') == 0:
+        rid = r['data']['record']['record_id']
+        # ── Manus原则③：上下文卸载提示（精简为1行）──────────────
+        ltype_short = ltype.split()[-1] if ' ' in ltype else ltype
+        print(f"✅ {ltype_short} → {c(C.GRAY, rid)}")
+
+        if args.phase:
+            api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}',
+                {'fields': _task_progress_fields(phase=args.phase)})
+            print(f"   {c(C.CYAN, '📍 任务进展 →')} {c(C.WHITE, args.phase)}")
+
+        if is_error and new_error_count is not None:
+            remaining = MAX_ERROR_RETRIES - new_error_count
+            if remaining > 0:
+                print(f"   ⚠  第 {new_error_count}/{MAX_ERROR_RETRIES} 次错误  （还剩 {remaining} 次机会）")
+            else:
+                print(f"   {c(C.RED, f'🚨 已达最大错误次数 ({MAX_ERROR_RETRIES})！自动阻塞任务并通知 owner...')}")
+                task_block_internal(c_, args.task_id, f'错误次数已达上限({MAX_ERROR_RETRIES})，需主人介入')
+                rec2 = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{args.task_id}')
+                task_name = ''
+                if rec2.get('code') == 0:
+                    task_name = rec2['data']['record']['fields'].get('任务名称', args.task_id) or args.task_id
+                notify_owner(args.task_id, task_name, new_error_count, args.content)
+
+        # ── Manus原则②：注意力刷新提醒 ──────────────────────────
+        log_count = _bump_log_count(args.task_id)
+        if log_count > 0 and log_count % 10 == 0:
+            print(f"   {c(C.CYAN, f'🔄 已写 {log_count} 条日志，建议刷新注意力：bm task show {args.task_id}')}")
+    else:
+        err(f'写入失败: {r.get("msg")}')
+
+
+def log_ls(args):
+    c_ = cfg()
+    log_table = c_['tables']['logs']['id']
+    conditions = [{'field_name': '关联任务ID', 'operator': 'is', 'value': [args.task_id]}]
+    if args.type:
+        ltype = LOG_TYPE_MAP.get(args.type, args.type)
+        conditions.append({'field_name': '类型', 'operator': 'is', 'value': [ltype]})
+    limit = args.last or 20
+    recs = search_records(log_table, {
+        'filter': {'conjunction': 'and', 'conditions': conditions},
+        'sort': [{'field_name': '记录时间', 'desc': True}],
+        'field_names': ['内容', '类型', '阶段', '记录时间'],
+        'page_size': 200
+    })
+    recs = recs[:limit]
+    total = len(recs)
+    label = f'  类型:{args.type}' if args.type else ''
+    print(f'\n{c(C.BOLD, "📋 执行日志")}  [{args.task_id[:12]}]{label}  ({total} 条)\n')
+    type_colors = {
+        '❌ 错误': C.RED, '🔍 发现': C.CYAN, '✅ 决策': C.GREEN,
+        '📋 计划': C.BLUE, '🏁 里程碑': C.YELLOW,
+        '📝 进度': C.WHITE, '🔧 工具结果': C.GRAY,
+    }
+    for rec in reversed(recs):
+        f = rec.get('fields', {})
+        ltype  = fv(f, '类型')
+        phase  = fv(f, '阶段')
+        ts     = fv(f, '记录时间')
+        content = fv(f, '内容', truncate=200)
+        tc = type_colors.get(ltype, C.WHITE)
+        header = c(tc, ltype)
+        if phase: header += f'  {c(C.GRAY, phase)}'
+        if ts:    header += f'  {c(C.GRAY, ts)}'
+        print(f'  {header}')
+        for line in content.split('\n')[:6]:
+            print(f'    {c(tc, line)}')
+        print()
+
+# ── MEM 子命令 ────────────────────────────────────────────────────
+
+MEM_TYPE_MAP = {'知识': '📘 知识', '教训': '⚠️ 教训', '偏好': '💡 偏好', '上下文': '🔗 上下文'}
+
+def mem_add(args):
+    c_ = cfg()
+    mem_table = c_['tables']['memory']['id']
+    mtype = MEM_TYPE_MAP.get(args.type, args.type)
+    importance = {'核心': '🔴 核心', '重要': '🟡 重要', '普通': '🟢 普通'}.get(args.importance, args.importance)
+    content_text = args.content
+    if len(content_text) > 800:
+        warn(f'内容超过 800 字（{len(content_text)} 字），已截断')
+        content_text = content_text[:800]
+    fields = {
+        '标题': args.title,
+        '类型': mtype,
+        '重要度': importance,
+        '内容': content_text,
+        '是否激活': True,
+        '记录时间': int(time.time() * 1000),
+    }
+    if args.task: fields['来源任务ID'] = args.task
+    r = api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{mem_table}/records', {'fields': fields})
+    if r.get('code') == 0:
+        rid = r['data']['record']['record_id']
+        ok(f'记忆已写入  {rid}')
+        print(f"   {c(C.CYAN, mtype)}  {c(C.WHITE, args.title)}")
+    else:
+        err(f'写入失败: {r.get("msg")}')
+
+
+def mem_ls(args):
+    c_ = cfg()
+    mem_table = c_['tables']['memory']['id']
+    recs = search_records(mem_table, {
+        'filter': {'conjunction': 'and', 'conditions': [
+            {'field_name': '是否激活', 'operator': 'is', 'value': [True]}
+        ]},
+        'field_names': ['标题', '类型', '重要度', '内容', '来源任务ID'],
+        'page_size': 50
+    })
+    print(f'\n{c(C.BOLD, "📚 记忆库")}  ({len(recs)} 条激活)\n')
+    for rec in recs:
+        f = rec.get('fields', {})
+        title = fv(f, '标题')
+        mtype = fv(f, '类型')
+        imp = fv(f, '重要度')
+        content = fv(f, '内容', truncate=80)
+        print(f'  {imp or ""}  {mtype or ""}  {c(C.WHITE, title or "")}')
+        if content: print(f'    {c(C.GRAY, content)}')
+
+
+def mem_search(args):
+    c_ = cfg()
+    mem_table = c_['tables']['memory']['id']
+    recs = search_records(mem_table, {
+        'filter': {'conjunction': 'and', 'conditions': [
+            {'field_name': '是否激活', 'operator': 'is', 'value': [True]}
+        ]},
+        'field_names': ['标题', '类型', '内容', '来源任务ID'],
+        'page_size': 200
+    })
+    kw = args.keyword.lower()
+    hits = [r for r in recs if kw in (fv(r.get('fields',{}), '标题') or '').lower()
+            or kw in (fv(r.get('fields',{}), '内容') or '').lower()]
+    print(f'\n{c(C.BOLD, "🔍 搜索结果")}  "{args.keyword}"  ({len(hits)} 条)\n')
+    for rec in hits:
+        f = rec.get('fields', {})
+        title = fv(f, '标题')
+        content = fv(f, '内容', truncate=120)
+        print(f'  {c(C.WHITE, title or "")}')
+        if content: print(f'    {c(C.GRAY, content)}')
+        print()
+
+
+def log_search(args):
+    """跨任务搜索执行日志（服务端 contains 搜索）"""
+    c_ = cfg()
+    log_table = c_['tables']['logs']['id']
+    task_table = c_['tables']['tasks']['id']
+
+    # 服务端搜索：内容字段 contains 关键词
+    recs = search_records(log_table, {
+        'filter': {'conjunction': 'and', 'conditions': [
+            {'field_name': '内容', 'operator': 'contains', 'value': [args.keyword]}
+        ]},
+        'sort': [{'field_name': '记录时间', 'desc': True}],
+        'field_names': ['内容', '关联任务ID', '类型', '阶段', '记录时间'],
+        'page_size': 200
+    })
+
+    limit = args.last or 15
+    recs = recs[:limit]
+
+    # 批量获取关联任务名称（去重）
+    task_ids = set()
+    for rec in recs:
+        tid = fv(rec.get('fields', {}), '关联任务ID')
+        if tid: task_ids.add(tid)
+
+    task_names = {}
+    for tid in task_ids:
+        r = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{task_table}/records/{tid}')
+        if r.get('code') == 0:
+            task_names[tid] = fv(r['data']['record']['fields'], '任务名称') or tid[:12]
+
+    print(f'\n{c(C.BOLD, "🔍 日志搜索")}  "{args.keyword}"  ({len(recs)} 条)\n')
+
+    type_colors = {
+        '❌ 错误': C.RED, '🔍 发现': C.CYAN, '✅ 决策': C.GREEN,
+        '📋 计划': C.BLUE, '🏁 里程碑': C.YELLOW,
+        '📝 进度': C.WHITE, '🔧 工具结果': C.GRAY,
+    }
+
+    for rec in recs:
+        f = rec.get('fields', {})
+        ltype   = fv(f, '类型')
+        tid     = fv(f, '关联任务ID')
+        ts      = fv(f, '记录时间')
+        content = fv(f, '内容', truncate=150)
+        tname   = task_names.get(tid, tid[:12] if tid else '?')
+
+        tc = type_colors.get(ltype, C.WHITE)
+        header = f'{c(tc, ltype)}  {c(C.WHITE, tname)}'
+        if ts: header += f'  {c(C.GRAY, ts)}'
+        print(f'  {header}')
+        for line in content.split('\n')[:4]:
+            print(f'    {c(C.GRAY, line)}')
+        print()
+
+
+# ── DISPATCH 子命令 ────────────────────────────────────────────────
+
+def _build_dispatch_prompt(task_rec, subtask_name, c_):
+    """从 Base 任务记录构建 sub-agent prompt"""
+    f = task_rec.get('fields', {})
+    record_id = task_rec.get('record_id', '')
+    name = fv(f, '任务名称')
+    instruction = fv(f, '原始指令')
+    plan = fv(f, '任务进展')
+    phase = fv(f, '任务进展')
+
+    # 解析子任务进度
+    subtasks = _parse_subtasks(plan) if plan else []
+    progress_lines = ''
+    if subtasks:
+        lines = []
+        for s in subtasks:
+            if plan and f'✅{s}' in plan:
+                lines.append(f'✅ {s}')
+            elif subtask_name and s == subtask_name:
+                lines.append(f'📍 {s} ← 当前')
+            else:
+                lines.append(f'○ {s}')
+        progress_lines = '\n'.join(lines)
+
+    # 读最近日志
+    log_table_id = c_['tables']['logs']['id']
+    log_lines = ''
+    if log_table_id and record_id:
+        try:
+            log_recs = search_records(log_table_id, {
+                'filter': {'conjunction': 'and', 'conditions': [
+                    {'field_name': '关联任务ID', 'operator': 'is', 'value': [record_id]},
+                ]},
+                'field_names': ['类型', '内容', '阶段', '记录时间'],
+                'sort': [{'field_name': '记录时间', 'desc': True}],
+                'page_size': 10,
+            })
+            if log_recs:
+                logs = []
+                for lr in log_recs:
+                    lf = lr.get('fields', {})
+                    t = fv(lf, '类型')
+                    ct = fv(lf, '内容')
+                    if ct:
+                        logs.append(f'- [{t}] {ct}')
+                log_lines = '\n'.join(logs)
+        except:
+            pass
+
+    # 拼装 prompt
+    parts = []
+    parts.append(f'## 任务目标\n{name}')
+    if instruction:
+        parts.append(f'## 原始指令\n{instruction}')
+    if plan:
+        parts.append(f'## 整体规划\n{plan}')
+    if progress_lines:
+        parts.append(f'## 当前进度\n{progress_lines}')
+    elif phase:
+        parts.append(f'## 当前进度\n{phase}')
+    if subtask_name:
+        parts.append(f'## 当前子任务\n名称：{subtask_name}')
+    if log_lines:
+        parts.append(f'## 关键发现和决策（从日志表）\n{log_lines}')
+
+    # 指令：sub-agent 用 bt 命令更新 Base
+    bt_instructions = [
+        '## 执行要求',
+        f'任务ID：{record_id}',
+        '',
+        '你有完整的工具权限（shell、文件读写、网络搜索等）。',
+        '请执行上述任务，并用以下 bt 命令更新进度：',
+        '',
+        f'- 记录发现：`bt log add {record_id} finding "发现内容"`',
+        f'- 记录决策：`bt log add {record_id} decision "决策内容"`',
+        f'- 记录错误：`bt log add {record_id} error "错误内容"`',
+        f'- 更新阶段：`bt task phase {record_id} "阶段N-描述"`',
+    ]
+    if subtask_name:
+        bt_instructions.append(f'- 子任务完成：`bt subtask done {record_id} "{subtask_name}" -s "摘要"`')
+    else:
+        bt_instructions.append(f'- 任务完成：`bt task done {record_id} -s "结果摘要"`')
+    bt_instructions.extend([
+        '',
+        '完成后务必调用上面的 done 命令标记完成。',
+    ])
+    parts.append('\n'.join(bt_instructions))
+
+    return '\n\n'.join(parts)
+
+
+def _find_first_incomplete_subtask(plan_txt):
+    """找到第一个未完成的子任务"""
+    if not plan_txt:
+        return None
+    subtasks = _parse_subtasks(plan_txt)
+    if not subtasks:
+        return None
+    for name in subtasks:
+        if f'✅{name}' not in plan_txt:
+            return name
+    return None  # 全部完成
+
+
+def dispatch_prep(args):
+    """bt dispatch prep — 准备下一个待执行任务的 prompt，输出 JSON"""
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+
+    # 复用 task_next 的排序逻辑
+    candidates = search_records(table_id, {
+        'filter': {'conjunction': 'or', 'conditions': [
+            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
+            {'field_name': '状态', 'operator': 'is', 'value': ['🕐 待开始']},
+        ]},
+        'field_names': ['任务名称', '状态', '优先级', '执行序号', '任务进展', '错误次数', '任务进展', '原始指令'],
+        'page_size': 50
+    })
+    if not candidates:
+        print(json.dumps({'status': 'empty', 'message': '没有待处理任务'}, ensure_ascii=False))
+        return
+
+    def sort_key(r):
+        f = r.get('fields', {})
+        pri = fv(f, '优先级')
+        sta = fv(f, '状态')
+        seq = int(fv(f, '执行序号') or 999)
+        return (_priority_rank(pri), _status_rank(sta), seq)
+
+    ranked = sorted(candidates, key=sort_key)
+    task = ranked[0]
+    f = task.get('fields', {})
+    record_id = task.get('record_id', '')
+    name = fv(f, '任务名称')
+    priority = fv(f, '优先级')
+    plan_txt = fv(f, '任务进展')
+    error_count = int(float(fv(f, '错误次数') or '0'))
+
+    # 检查错误次数
+    if error_count >= MAX_ERROR_RETRIES:
+        print(json.dumps({
+            'status': 'blocked',
+            'recordId': record_id,
+            'message': f'错误次数已达上限({error_count}/{MAX_ERROR_RETRIES})'
+        }, ensure_ascii=False))
+        return
+
+    # 找子任务
+    subtask_name = _find_first_incomplete_subtask(plan_txt)
+
+    # 如果是待开始，更新为进行中
+    status = fv(f, '状态')
+    if status == '🕐 待开始':
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+            'fields': {
+                '状态': '🔄 进行中',
+                '开始执行时间': int(time.time() * 1000),
+            }
+        })
+
+    # 构建 prompt
+    prompt = _build_dispatch_prompt(task, subtask_name, c_)
+
+    result = {
+        'status': 'ready',
+        'recordId': record_id,
+        'taskName': name,
+        'priority': priority,
+        'subtask': subtask_name,
+        'errorCount': error_count,
+        'prompt': prompt,
+    }
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def dispatch_status(args):
+    """bt dispatch status — 检查是否有正在运行的 dispatch sub-agent"""
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    recs = search_records(table_id, {
+        'filter': {'conjunction': 'and', 'conditions': [
+            {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
+        ]},
+        'field_names': ['任务名称', '优先级', '任务进展', '错误次数'],
+        'page_size': 10
+    })
+    if not recs:
+        print(c(C.GREEN, '✅ 没有进行中的任务'))
+        return
+    print(f'\n{c(C.BOLD, "📊 进行中任务")}  ({len(recs)} 个)\n')
+    for r in recs:
+        f = r.get('fields', {})
+        rid = r.get('record_id', '')
+        name = fv(f, '任务名称', 30)
+        pri = fv(f, '优先级')
+        phase = fv(f, '任务进展', 30)
+        print(f'  {fmt_priority(pri)}  {c(C.WHITE, name)}')
+        if phase:
+            print(f'    {c(C.GRAY, f"📍 {phase}")}')
+        print(f'    {c(C.GRAY, rid)}')
+
+
+def dispatch_done(args):
+    """bt dispatch done <id> <result> — 解析 sub-agent 结果并更新 Base
+    result 可以是：
+    - "done" / "error" / "blocked" （简单状态）
+    - JSON 字符串 {"status":"done","summary":"..."}
+    """
+    c_ = cfg()
+    table_id = c_['tables']['tasks']['id']
+    log_table_id = c_['tables']['logs']['id']
+    record_id = args.id
+    raw_result = args.result
+    summary = args.summary
+    subtask_name = args.subtask
+
+    # 解析结果
+    status = 'done'
+    try:
+        parsed = json.loads(raw_result)
+        status = parsed.get('status', 'done')
+        if not summary:
+            summary = parsed.get('summary', parsed.get('message', parsed.get('reason', '')))
+    except (json.JSONDecodeError, TypeError):
+        # 简单字符串：done / error / blocked
+        status = raw_result.strip().lower()
+        if status not in ('done', 'error', 'blocked'):
+            status = 'done'
+
+    summary = (summary or '')[:200]
+
+    if status == 'done':
+        if subtask_name:
+            # 模拟 subtask done
+            import subprocess
+            cmd = ['bt', 'subtask', 'done', record_id, subtask_name, '-s', summary or f'{subtask_name} 完成']
+            subprocess.run(cmd)
+        else:
+            # 模拟 task done
+            import subprocess
+            cmd = ['bt', 'task', 'done', record_id, '-s', summary, '--force']
+            subprocess.run(cmd)
+    elif status == 'error':
+        # 记录错误
+        r = api('GET', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}')
+        rec = r.get('data', {}).get('record', {})
+        cur_count = int(float(fv(rec.get('fields', {}), '错误次数') or '0'))
+        new_count = cur_count + 1
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+            'fields': {'错误次数': new_count}
+        })
+        # 写 error 日志
+        api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records', {
+            'fields': {
+                '关联任务ID': record_id,
+                '类型': '❌ 错误',
+                '内容': f'dispatch错误(#{new_count})：{summary}'[:500],
+            }
+        })
+        if new_count >= MAX_ERROR_RETRIES:
+            api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+                'fields': {'状态': '🚧 阻塞中'}
+            })
+            warn(f'错误达上限({new_count}/{MAX_ERROR_RETRIES})，任务已阻塞')
+        else:
+            warn(f'错误 #{new_count}/{MAX_ERROR_RETRIES}：{summary}')
+    elif status == 'blocked':
+        api('PUT', f'/bitable/v1/apps/{c_["app_token"]}/tables/{table_id}/records/{record_id}', {
+            'fields': {'状态': '🚧 阻塞中'}
+        })
+        # 写阻塞日志
+        api('POST', f'/bitable/v1/apps/{c_["app_token"]}/tables/{log_table_id}/records', {
+            'fields': {
+                '关联任务ID': record_id,
+                '类型': '🚧 阻塞',
+                '内容': f'阻塞原因：{summary}'[:500],
+            }
+        })
+        warn(f'任务已标记阻塞：{summary}')
+
+
+# ── INJECT AGENTS ─────────────────────────────────────────────────
+
+_AGENTS_INJECT_CONTENT = """\
+
+## 📋 任务执行规范（Base Memory）
+
+> base-memory 不是按需触发的 skill，而是你的**默认工作方式**。
+> 收到任何任务都应遵循此工作流；对话（回复/问答/短确认）直接回复即可。
+
+### 任务接收协议
+
+收到消息先判断：含动词+交付物（帮我做X / 写Y / 分析Z / 实现W）→ ✅ 任务（走 bm 流程）；
+回复/澄清/问答/短确认 → 💬 对话（直接回复，不建表）
+
+### 启动流程（必须按顺序，不可跳过）
+
+```bash
+bm task add "任务名" -i "原始指令" [-p 普通|重要|紧急]  # 1. 建任务入队
+bm task phase <id> "阶段1-需求探索"                      # 2. 设置当前阶段
+bm log add <id> plan "目标/阶段/关键问题/约束"           # 3. 写计划（强制）
+```
+
+优先级识别：紧急/急/高优 → `-p 紧急`；重要/尽快 → `-p 重要`；其他 → `-p 普通`
+
+### 上下文卸载规则（工具结果不留在上下文里）
+
+```bash
+bm log add <id> finding "搜索/查看/浏览器发现"           # 每2次操作后必写
+bm log add <id> decision "决策：用A不用B，理由：..."     # 重要技术选择时
+bm log add <id> error "错误：...\n原因：...\n方案：..."  # 遇到错误立刻记
+bm log add <id> resource "URL 或文件路径"                # 有用资源
+```
+
+🔴 看到图片/截图后**立刻** `bm log add finding` 文字化（多模态内容不持久！）
+
+### 阶段转换（每个阶段完成时必须执行）
+
+```bash
+bm task phase <id> "阶段N-名称"          # 更新当前阶段
+bm log add <id> milestone "阶段N完成：..." # 记录里程碑
+bm task next                              # ⚠️ 中断检查：有更高优先级任务插入？
+bm task show <id>                         # 每 >10 次工具调用后刷新注意力
+```
+
+### 错误协议（强制）
+
+每次失败 → `bm log add <id> error` → **必须改变方法**才能重试
+🚫 不允许用完全相同的方式原样重试；第 5 次失败自动阻塞 + 通知 owner
+
+### 完成协议
+
+```bash
+bm task done <id> -s "结果摘要（≤200字）"
+# 然后回复用户，附上结论
+```
+
+完整规范：`references/workflow-rules.md`（base-memory skill 目录下）
+"""
+
+
+def _inject_agents_md():
+    """将精简版任务执行规范追加到 AGENTS.md。"""
+    # 自动发现 workspace 路径
+    workspace = os.environ.get('OPENCLAW_WORKSPACE') or os.path.expanduser('~/.openclaw/workspace')
+    agents_path = os.path.join(workspace, 'AGENTS.md')
+
+    # 检查是否已集成
+    if os.path.exists(agents_path):
+        with open(agents_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        if 'bm task' in content or 'base-memory' in content:
+            print(f'{c(C.YELLOW, "⚠️  AGENTS.md 已集成 base-memory 规范，跳过注入。")}')
+            return
+
+    # 追加内容
+    with open(agents_path, 'a', encoding='utf-8') as f:
+        f.write(_AGENTS_INJECT_CONTENT)
+
+    print(f'{c(C.GREEN, "✅ 任务执行规范已写入：")} {agents_path}')
+    print(f'{c(C.GRAY, "   包含：任务接收协议 / 启动流程 / 上下文卸载 / 错误协议 / 完成协议")}')
+
+
+# ── MAIN ──────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog='bm',
+        description=c(C.CYAN, 'bm — Base Memory CLI'),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest='cmd', metavar='<命令>')
+
+    # ── setup ──
+    setup_p = sub.add_parser('setup', help='初始化: 创建 Base 表结构并生成配置')
+    setup_p.add_argument('--app-token', help='已有的多维表格 app_token（不传则创建新的）')
+    setup_p.add_argument('--inject-agents', action='store_true',
+                         help='将任务执行规范追加到 AGENTS.md（已集成则跳过）')
+
+    # ── task ──
+    task_p = sub.add_parser('task', help='任务管理')
+    task_sub = task_p.add_subparsers(dest='action', metavar='<操作>')
+
+    # task add
+    p = task_sub.add_parser('add', help='新建任务')
+    p.add_argument('name', help='任务名称')
+    p.add_argument('-p', '--priority', default='普通', metavar='级别',
+                   help='紧急|重要|普通 (默认:普通)')
+    p.add_argument('-i', '--instruction', default='', metavar='指令', help='原始指令')
+    p.add_argument('--parent', default='', metavar='父任务ID', help='父任务 record_id（子任务时使用）')
+
+    # task done
+    p = task_sub.add_parser('done', help='标记完成')
+    p.add_argument('id', help='record_id')
+    p.add_argument('-t', '--tokens', type=int, default=0, metavar='N', help='Token 开销（手动指定）')
+    p.add_argument('--tokens-now', type=int, default=0, dest='tokens_now', metavar='N',
+                   help='当前 session in-token 总数（自动与快照做 delta）')
+    p.add_argument('-s', '--summary', default='', metavar='摘要', help='结果摘要（一句话）')
+    p.add_argument('--force', action='store_true', help='强制完成（跳过待开始状态检查）')
+
+    # task up (update)
+    p = task_sub.add_parser('up', help='更新字段')
+    p.add_argument('id', help='record_id')
+    p.add_argument('field', help='字段名（如：下一步行动）')
+    p.add_argument('value', help='新值')
+
+    # task block
+    p = task_sub.add_parser('block', help='标记阻塞')
+    p.add_argument('id', help='record_id')
+    p.add_argument('-r', '--reason', required=True, metavar='原因', help='阻塞原因')
+
+    # task next
+    p = task_sub.add_parser('next', help='调度器：推荐当前应该执行的最高优先级任务')
+    p.add_argument('-n', '--notify', action='store_true', help='有紧急任务未执行时自动发飞书通知')
+
+    # task interrupt
+    p = task_sub.add_parser('interrupt', help='打断当前任务，保存断点，让位给更高优先级任务')
+    p.add_argument('id', help='record_id')
+    p.add_argument('-m', '--note', default='', metavar='断点信息', help='断点备注（下次恢复时的提示）')
+
+    # task ls
+    p = task_sub.add_parser('ls', help='列出任务')
+    p.add_argument('-a', '--all', action='store_true', help='显示全部未完成')
+    p.add_argument('-s', '--status', metavar='状态', help='按状态筛选（逗号分隔）')
+
+    # task resume
+    task_sub.add_parser('resume', help='重启恢复（进行中+阻塞中，含断点）')
+
+    # task search
+    p = task_sub.add_parser('search', help='关键词搜索')
+    p.add_argument('keyword', help='搜索词')
+
+    # task show
+    p = task_sub.add_parser('show', help='查看任务详情')
+    p.add_argument('id', help='record_id')
+
+    # task phase
+    p = task_sub.add_parser('phase', help='更新任务进展')
+    p.add_argument('id', help='record_id')
+    p.add_argument('phase', help='阶段名称（如：阶段2-实现）')
+
+    # task token-snap（由 agent 在 bm task add 后调用，存 token 快照）
+    p = task_sub.add_parser('token-snap', help='记录任务开始时的 token 快照')
+    p.add_argument('task_id', help='record_id')
+    p.add_argument('in_tokens', help='当前 session in-token 总数（从 session_status 读取）')
+
+    # ── subtask ──
+    subtask_p = sub.add_parser('subtask', help='子任务管理（内联在父任务行）')
+    subtask_sub = subtask_p.add_subparsers(dest='action', metavar='<操作>')
+
+    # subtask done
+    p = subtask_sub.add_parser('done', help='标记子任务完成（更新父任务行字段）')
+    p.add_argument('parent_id', help='父任务 record_id')
+    p.add_argument('subtask_name', help='子任务名称（与 bm task add 时完全一致）')
+    p.add_argument('-s', '--summary', default='', metavar='摘要', help='完成摘要')
+
+    # subtask phase
+    p = subtask_sub.add_parser('phase', help='更新子任务当前步骤（更新「任务进展」字段）')
+    p.add_argument('parent_id', help='父任务 record_id')
+    p.add_argument('subtask_name', help='子任务名称')
+    p.add_argument('step', help='当前步骤描述，如"阶段2-代码实现（下一步：写单测）"')
+
+    # subtask add（批量添加，比逐个 bm task add --parent 节省 API 调用）
+    p = subtask_sub.add_parser('add', help='批量添加子任务到父任务（1次GET+1次PUT）')
+    p.add_argument('parent_id', help='父任务 record_id')
+    p.add_argument('names', nargs='+', help='子任务名称（可多个）')
+
+    # ── log ──
+    log_p = sub.add_parser('log', help='执行日志（上下文卸载）')
+    log_sub = log_p.add_subparsers(dest='action', metavar='<操作>')
+
+    # log add
+    p = log_sub.add_parser('add', help='写入日志条目')
+    p.add_argument('task_id', help='关联任务 record_id')
+    p.add_argument('type', help='类型: plan|finding|error|decision|milestone|progress|tool')
+    p.add_argument('content', help='内容')
+    p.add_argument('--phase', default='', metavar='阶段', help='任务进展')
+    p.add_argument('--attempt', type=int, default=0, metavar='N', help='尝试次数（用于错误追踪）')
+    p.add_argument('--file', default='', metavar='路径', help='附件文件路径（截图/大文件）')
+
+    # log ls
+    p = log_sub.add_parser('ls', help='查看任务日志')
+    p.add_argument('task_id', help='关联任务 record_id')
+    p.add_argument('--type', default='', metavar='类型', help='按类型筛选')
+    p.add_argument('--last', type=int, default=20, metavar='N', help='最近N条（默认20）')
+
+    # log search
+    p = log_sub.add_parser('search', help='跨任务搜索日志（服务端搜索）')
+    p.add_argument('keyword', help='搜索关键词')
+    p.add_argument('--last', type=int, default=15, metavar='N', help='最多返回N条（默认15）')
+
+    # ── mem ──
+    mem_p = sub.add_parser('mem', help='记忆库管理（长期知识沉淀）')
+    mem_sub = mem_p.add_subparsers(dest='action', metavar='<操作>')
+
+    # mem add
+    p = mem_sub.add_parser('add', help='写入记忆')
+    p.add_argument('title', help='标题')
+    p.add_argument('content', help='内容')
+    p.add_argument('-t', '--type', default='知识', metavar='类型',
+                   help='知识|教训|偏好|上下文 (默认:知识)')
+    p.add_argument('-i', '--importance', default='重要', metavar='重要度',
+                   help='核心|重要|普通 (默认:重要)')
+    p.add_argument('--task', default='', metavar='任务ID', help='关联任务ID')
+
+    # mem ls
+    mem_sub.add_parser('ls', help='列出激活记忆')
+
+    # mem search
+    p = mem_sub.add_parser('search', help='搜索记忆')
+    p.add_argument('keyword', help='搜索词')
+
+    # ── dispatch ──
+    dispatch_p = sub.add_parser('dispatch', help='调度器：准备任务 prompt 供 sessions_spawn 使用')
+    dispatch_sub = dispatch_p.add_subparsers(dest='action', metavar='<操作>')
+
+    # dispatch prep — 获取下一个任务并构建 prompt
+    p = dispatch_sub.add_parser('prep', help='准备下一个任务的 prompt（JSON 输出）')
+    p.add_argument('--json', action='store_true', dest='json_output', help='纯 JSON 输出（供程序调用）')
+
+    # dispatch done — 解析 sub-agent 结果并更新 Base
+    p = dispatch_sub.add_parser('done', help='解析执行结果并更新 Base')
+    p.add_argument('id', help='record_id')
+    p.add_argument('result', help='结果 JSON 字符串 或 "done"/"error"/"blocked"')
+    p.add_argument('-s', '--summary', default='', metavar='摘要', help='结果摘要')
+    p.add_argument('--subtask', default='', metavar='子任务名', help='子任务名称（有子任务时）')
+
+    # dispatch status — 查看进行中任务
+    dispatch_sub.add_parser('status', help='查看进行中任务状态')
+
+    # ── 路由 ──
+    args = parser.parse_args()
+
+    if args.cmd == 'setup':
+        import subprocess
+        setup_script = os.path.join(SCRIPT_DIR, 'bt_setup.py')
+        cmd = [sys.executable, setup_script]
+        if args.app_token:
+            cmd.extend(['--app-token', args.app_token])
+        exit_code = subprocess.call(cmd)
+        if exit_code == 0:
+            if args.inject_agents:
+                _inject_agents_md()
+            else:
+                print(f'\n{c(C.GRAY, "💡 提示：运行 `bm setup --inject-agents` 将任务规范写入 AGENTS.md")}')
+        sys.exit(exit_code)
+
+    if args.cmd == 'task':
+        if not args.action:   task_p.print_help(); return
+        dispatch = {
+            'add': task_add, 'done': task_done, 'up': task_update,
+            'block': task_block, 'interrupt': task_interrupt, 'next': task_next,
+            'ls': task_ls, 'resume': task_resume,
+            'search': task_search, 'show': task_show, 'phase': task_phase,
+            'token-snap': task_token_snap,
+        }
+        dispatch.get(args.action, lambda a: task_p.print_help())(args)
+
+    elif args.cmd == 'subtask':
+        if not args.action:   subtask_p.print_help(); return
+        dispatch = {'done': subtask_done, 'phase': subtask_phase, 'add': subtask_add_batch}
+        dispatch.get(args.action, lambda a: subtask_p.print_help())(args)
+
+    elif args.cmd == 'log':
+        if not args.action:   log_p.print_help(); return
+        dispatch = {'add': log_add, 'ls': log_ls, 'search': log_search}
+        dispatch.get(args.action, lambda a: log_p.print_help())(args)
+
+    elif args.cmd == 'mem':
+        if not args.action:   mem_p.print_help(); return
+        dispatch = {'add': mem_add, 'ls': mem_ls, 'search': mem_search}
+        dispatch.get(args.action, lambda a: mem_p.print_help())(args)
+
+    elif args.cmd == 'dispatch':
+        if not args.action:   dispatch_p.print_help(); return
+        dispatch = {'prep': dispatch_prep, 'done': dispatch_done, 'status': dispatch_status}
+        dispatch.get(args.action, lambda a: dispatch_p.print_help())(args)
+
+    else:
+        # 无参数时显示帮助 + 当前状态
+        print(f'\n{c(C.BOLD+C.CYAN, "🦞 bm — Base Memory CLI")}\n')
+        print(f'  {c(C.GRAY, "任务:    bm task add|done|up|block|interrupt|next|ls|resume|search|show|phase")}')
+        subtask_hint = '子任务:  bm subtask done|phase <父ID> "子任务名"  （内联在父任务行）'
+        print(f'  {c(C.GRAY, subtask_hint)}')
+        print(f'  {c(C.GRAY, "日志:    bm log add|ls|search  （上下文卸载 + 跨任务搜索）")}')
+        print(f'  {c(C.GRAY, "记忆:    bm mem add|ls|search  （长期知识沉淀）")}')
+        
+        print(f'  {c(C.GRAY, "文档:  https://github.com/dsjgudfiufr/base-memory")}\n')
+        # 快速显示进行中任务数
+        try:
+            c_ = cfg()
+            table_id = c_['tables']['tasks']['id']
+            recs = search_records(table_id, {
+                'filter': {'conjunction': 'or', 'conditions': [
+                    {'field_name': '状态', 'operator': 'is', 'value': ['🔄 进行中']},
+                    {'field_name': '状态', 'operator': 'is', 'value': ['🚧 阻塞中']},
+                ]}
+            })
+            if recs:
+                print(f'  {c(C.YELLOW, f"⚡ 当前有 {len(recs)} 个任务进行中，运行 bm task resume 查看")}\n')
+        except:
+            pass
+
+if __name__ == '__main__':
+    main()
