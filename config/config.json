@@ -1,0 +1,48 @@
+{
+  "feishu": {
+    "domain": "bytedance.larkoffice.com",
+    "_comment": "凭证自动从宿主 openclaw.json 读取，无需在此配置。如需覆盖可加 appId/appSecret"
+  },
+  "bitable": {
+    "appToken": "A2lQbzixpa97Disc03AcJY97nPh",
+    "taskTableId": "tblPasslJCa2M8Vu",
+    "rosterTableId": "tblbD6flWwAyBmYZ",
+    "archiveTableId": "tblbD6flWwAyBmYZ",
+    "_comment": "appToken 和 taskTableId 指向群里葫芦娃的任务中枢，rosterTableId 待确认"
+  },
+  "notify": {
+    "webhookUrl": "http://127.0.0.1:18789/hooks/wake",
+    "webhookToken": "YOUR_WEBHOOK_TOKEN"
+  },
+  "timeouts": {
+    "🔍调研": 10,
+    "📝文档": 10,
+    "🛠️开发": 15,
+    "🧪测试": 10,
+    "⚙️运维": 10,
+    "💡创意": 10
+  },
+  "review": {
+    "strictMode": true,
+    "requiredFields": {
+      "🔍调研": [
+        "数据来源URL",
+        "对比维度",
+        "分析总结"
+      ],
+      "📝文档": [
+        "内容完整",
+        "格式统一"
+      ],
+      "🛠️开发": [
+        "代码可运行",
+        "使用说明",
+        "关键注释"
+      ],
+      "💡创意": [
+        "满足数量",
+        "内容有新意"
+      ]
+    }
+  }
+}
